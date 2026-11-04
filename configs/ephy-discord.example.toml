@@ -5,6 +5,7 @@
 guild_id = 1
 allowed_channel_ids = [1]
 admin_user_ids = []
+approver_user_ids = []
 
 [llm]
 # ephy-runtime Gateway．llama.cpp の OpenAI 互換 /v1 に向けるときは via_gateway を false にする．
@@ -41,3 +42,14 @@ window_seconds = 60
 
 [audit]
 path = "data/audit.jsonl"
+
+[mcp]
+# コネクタ用．既定は無効．有効にするときはループバックだけを待ち，合言葉は環境変数に置く．
+enabled = false
+bind_host = "127.0.0.1"
+port = 8791
+public_base_url = ""
+token_ttl_seconds = 3600
+
+[approval]
+expiry_seconds = 900

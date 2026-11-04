@@ -4,6 +4,7 @@
 guild_id = 1
 allowed_channel_ids = [1]
 admin_user_ids = []
+approver_user_ids = []
 
 [llm]
 base_url = "http://127.0.0.1:8765/v1"
@@ -38,3 +39,13 @@ window_seconds = 60
 
 [audit]
 path = "data/local-mock-audit.jsonl"
+
+[mcp]
+enabled = false
+bind_host = "127.0.0.1"
+port = 8791
+public_base_url = ""
+token_ttl_seconds = 3600
+
+[approval]
+expiry_seconds = 900

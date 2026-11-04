@@ -7,6 +7,7 @@ import logging
 import discord
 from discord import app_commands
 
+from ephy_discord.approval import NO_APPROVERS, REAL_KIND, STUB_KIND, ApprovalQueue
 from ephy_discord.config import AppConfig
 from ephy_discord.handlers import (
     CHANNEL_DENIED,
@@ -16,12 +17,14 @@ from ephy_discord.handlers import (
     handle_stop,
     is_actor_admin,
 )
+from ephy_discord.mcp import McpApp, load_mcp_secrets, mcp_can_listen, serve_mcp
 from ephy_discord.permissions import (
     INTENT_GUILD_MESSAGES,
     INTENT_GUILDS,
     INTENT_MESSAGE_CONTENT,
 )
 from ephy_discord.service import AdapterService
+from ephy_discord.store import format_time
 from ephy_discord.text import extract_question, split_discord_text
 
 log = logging.getLogger(__name__)
@@ -118,6 +121,8 @@ class EphyDiscordBot(discord.Client):
         super().__init__(intents=build_intents())
         self.config = config
         self.service = service
+        self.approvals = ApprovalQueue(config, service.store)
+        self._mcp_runner = None
         self.tree = app_commands.CommandTree(self)
         self.tree.add_command(build_command_group(self))
 
@@ -128,6 +133,19 @@ class EphyDiscordBot(discord.Client):
             await self.tree.sync(guild=guild)
         except discord.HTTPException:
             log.error("slash command sync failed")
+        for action in self.approvals.pending():
+            self.add_view(build_approval_view(self, action["id"]))
+        await self._maybe_start_mcp()
+
+    async def _maybe_start_mcp(self) -> None:
+        secrets = load_mcp_secrets()
+        if not mcp_can_listen(self.config, secrets):
+            if self.config.mcp.enabled:
+                log.error("mcp is enabled but no bearer token or oauth secret is set")
+            return
+        app = McpApp(self.config, self.service, secrets)
+        self._mcp_runner = await serve_mcp(app, self.config.mcp.bind_host, self.config.mcp.port)
+        log.info("mcp listening on %s:%s", self.config.mcp.bind_host, self.config.mcp.port)
 
     async def on_message(self, message: discord.Message) -> None:
         await handle_incoming_message(
@@ -135,6 +153,8 @@ class EphyDiscordBot(discord.Client):
         )
 
     async def close(self) -> None:
+        if self._mcp_runner is not None:
+            await self._mcp_runner.cleanup()
         await self.service.aclose()
         await super().close()
 
@@ -158,6 +178,22 @@ def build_command_group(bot: EphyDiscordBot) -> app_commands.Group:
     @group.command(name="stop", description="ボットを停止する")
     async def stop(interaction: discord.Interaction) -> None:
         await slash_stop(interaction, config=bot.config, service=bot.service)
+
+    @group.command(name="propose", description="返信または未実装の操作を承認待ちにする")
+    @app_commands.describe(text="承認後に扱う本文", kind="reply は返信，stub は記録だけ")
+    @app_commands.choices(
+        kind=[
+            app_commands.Choice(name="返信", value=REAL_KIND),
+            app_commands.Choice(name="未実装の操作", value=STUB_KIND),
+        ]
+    )
+    async def propose(
+        interaction: discord.Interaction,
+        text: str,
+        kind: app_commands.Choice[str] | None = None,
+    ) -> None:
+        selected = kind.value if kind is not None else REAL_KIND
+        await slash_propose(interaction, text, selected, bot=bot)
 
     return group
 
@@ -224,6 +260,116 @@ async def slash_stop(
     service: AdapterService,
 ) -> None:
     await handle_stop(InteractionResponder(interaction, config), service)
+
+
+async def slash_propose(
+    interaction: discord.Interaction,
+    text: str,
+    kind: str,
+    *,
+    bot: EphyDiscordBot,
+) -> None:
+    config = bot.config
+    if interaction.guild_id != config.guild_id or not config.allowlist.permits(
+        interaction.guild_id, interaction.channel_id
+    ):
+        await interaction.response.send_message(CHANNEL_DENIED, ephemeral=True)
+        return
+    if not config.approver_user_ids:
+        await interaction.response.send_message(NO_APPROVERS, ephemeral=True)
+        return
+    decision = bot.service.store.consume_rate(str(interaction.user.id), str(interaction.channel_id))
+    if not decision.allowed:
+        await interaction.response.send_message(
+            "少し待ってからもう一度提案してください．",
+            ephemeral=True,
+        )
+        return
+    payload = {"text": text} if kind == REAL_KIND else {"name": "outbound", "text": text}
+    action = bot.approvals.propose(
+        guild_id=interaction.guild_id or 0,
+        channel_id=interaction.channel_id or 0,
+        requester_user_id=interaction.user.id,
+        kind=kind,
+        payload=payload,
+    )
+    bot.service.audit.write(
+        {
+            "ts": format_time(bot.service.store.clock.now()),
+            "event": "action_proposed",
+            "user_id": str(interaction.user.id),
+            "channel_id": str(interaction.channel_id),
+            "guild_id": str(interaction.guild_id),
+            "action_id": action["id"],
+            "action_kind": kind,
+        }
+    )
+    await interaction.response.send_message(
+        "承認を待っています．承認者だけがボタンを押せます．",
+        view=build_approval_view(bot, action["id"]),
+    )
+
+
+def build_approval_view(bot: EphyDiscordBot, action_id: str) -> discord.ui.View:
+    view = discord.ui.View(timeout=None)
+
+    async def on_approve(interaction: discord.Interaction) -> None:
+        await press_approval(bot, interaction, action_id, "approved")
+
+    async def on_reject(interaction: discord.Interaction) -> None:
+        await press_approval(bot, interaction, action_id, "rejected")
+
+    approve = discord.ui.Button(
+        label="承認",
+        style=discord.ButtonStyle.success,
+        custom_id=f"ephy:approve:{action_id}",
+    )
+    reject = discord.ui.Button(
+        label="却下",
+        style=discord.ButtonStyle.danger,
+        custom_id=f"ephy:reject:{action_id}",
+    )
+    approve.callback = on_approve
+    reject.callback = on_reject
+    view.add_item(approve)
+    view.add_item(reject)
+    return view
+
+
+async def press_approval(
+    bot: EphyDiscordBot,
+    interaction: discord.Interaction,
+    action_id: str,
+    decision: str,
+) -> None:
+    result = bot.approvals.decide(action_id, interaction.user.id, decision)
+    bot.service.audit.write(
+        {
+            "ts": format_time(bot.service.store.clock.now()),
+            "event": "action_decided",
+            "user_id": str(interaction.user.id),
+            "channel_id": str(interaction.channel_id or ""),
+            "guild_id": str(interaction.guild_id or ""),
+            "action_id": action_id,
+            "action_kind": result.kind,
+            "decision": result.status,
+        }
+    )
+    if (
+        result.status == "approved"
+        and result.kind == REAL_KIND
+        and result.reply_text
+        and interaction.channel is not None
+        and bot.config.allowlist.permits(interaction.guild_id, interaction.channel.id)
+    ):
+        await interaction.channel.send(
+            result.reply_text,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+    if interaction.response.is_done():
+        await interaction.followup.send(result.text, ephemeral=result.status == "forbidden")
+    else:
+        await interaction.response.send_message(result.text, ephemeral=result.status == "forbidden")
 
 
 def intent_value(intents: discord.Intents) -> int:

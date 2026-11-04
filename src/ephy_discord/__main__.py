@@ -10,7 +10,14 @@ import sys
 
 from ephy_discord import __version__
 from ephy_discord.bot import EphyDiscordBot, build_intents, minimal_permissions
-from ephy_discord.config import TOKEN_ENV, load_config, read_bot_token, resolved_karte_dir
+from ephy_discord.config import (
+    MCP_BEARER_ENV,
+    MCP_OAUTH_ENV,
+    TOKEN_ENV,
+    load_config,
+    read_bot_token,
+    resolved_karte_dir,
+)
 from ephy_discord.mock_llm import serve
 from ephy_discord.permissions import minimal_permission_value
 from ephy_discord.service import Turn, build_service
@@ -60,6 +67,12 @@ def _check(path: str) -> int:
         f"llm={config.llm.base_url} model={config.llm.model} via_gateway={config.llm.via_gateway}"
     )
     print(f"karte_mode={config.karte.mode} karte_dir_set={bool(karte_dir)}")
+    print(
+        f"mcp_enabled={config.mcp.enabled} mcp_port={config.mcp.port} "
+        f"approvers={len(config.approver_user_ids)}"
+    )
+    print(f"{MCP_BEARER_ENV}={'set' if os.environ.get(MCP_BEARER_ENV, '').strip() else 'unset'}")
+    print(f"{MCP_OAUTH_ENV}={'set' if os.environ.get(MCP_OAUTH_ENV, '').strip() else 'unset'}")
     print(f"intents={intents.value} permissions={minimal_permissions().value}")
     print(f"permission_bits={minimal_permission_value()}")
     print(f"{TOKEN_ENV}={'set' if token_set else 'unset'}")

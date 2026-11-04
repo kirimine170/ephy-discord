@@ -10,6 +10,8 @@ build/
 
 .env
 data/
+configs/*.local.toml
+*.dpapi
 *.sqlite
 *.sqlite3
 *.sqlite-journal

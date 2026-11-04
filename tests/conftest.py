@@ -4,10 +4,12 @@ from datetime import UTC, datetime, timedelta
 
 from ephy_discord.config import (
     AppConfig,
+    ApprovalConfig,
     AuditConfig,
     CacheConfig,
     KarteConfig,
     LlmConfig,
+    McpConfig,
     RateLimitConfig,
 )
 from ephy_discord.karte import ContextPack
@@ -53,6 +55,14 @@ class FakeKarte:
         self.queries.append(query)
         return self.pack
 
+    def search(self, query: str) -> dict:
+        self.queries.append(query)
+        return {"status": self.pack.status, "results": []}
+
+    def read_document(self, doc_id: str) -> dict:
+        self.queries.append(doc_id)
+        return {"status": self.pack.status, "document": None}
+
 
 class FakeCtx:
     def __init__(
@@ -85,6 +95,7 @@ def make_config(
     guild_id: int = 1,
     channels: tuple[int, ...] = (10,),
     admins: tuple[int, ...] = (),
+    approvers: tuple[int, ...] = (),
     user_per_minute: int = 3,
     channel_per_minute: int = 10,
     dedupe_seconds: int = 600,
@@ -96,6 +107,7 @@ def make_config(
         guild_id=guild_id,
         allowed_channel_ids=frozenset(channels),
         admin_user_ids=frozenset(admins),
+        approver_user_ids=frozenset(approvers),
         llm=LlmConfig(
             base_url="http://127.0.0.1:9/v1",
             model="auto",
@@ -128,6 +140,14 @@ def make_config(
             window_seconds=window_seconds,
         ),
         audit=AuditConfig(path=str(tmp_path / "audit.jsonl")),
+        mcp=McpConfig(
+            enabled=False,
+            bind_host="127.0.0.1",
+            port=8791,
+            public_base_url="",
+            token_ttl_seconds=3600,
+        ),
+        approval=ApprovalConfig(expiry_seconds=900),
     )
 
 

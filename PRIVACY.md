@@ -22,5 +22,6 @@
 ## 学習と外部送信
 
 - 保存した内容をモデルの学習，微調整，評価データセットには使いません．
+- コネクタから届いた SNS の発見も同じ SQLite に置き，同じ保持日数で消します．Karte へは書きません．OAuth のトークンとクライアント秘密は SHA-256 だけを保存し，Bearer の静的な値は環境変数のままにします．
 - O-1 の送信先は，設定したループバックのローカルモデル（ephy-runtime Gateway または llama.cpp）と，同じマシン上の Karte Context Protocol v1 だけです．Grok，OpenAI，その他の外部 API には送りません．
 - Bot token は環境変数 `DISCORD_BOT_TOKEN` だけから読み，設定ファイル，SQLite，監査ログ，Git には書きません．
