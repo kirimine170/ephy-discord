@@ -1,0 +1,43 @@
+# 霧峰帝国議会で動かす読み取り専用ボットの例．
+# Git 外のコピーへ実 ID を書き，このファイルの ID のまま本番へ向けない．
+
+[discord]
+guild_id = 1
+allowed_channel_ids = [1]
+admin_user_ids = []
+
+[llm]
+# ephy-runtime Gateway．llama.cpp の OpenAI 互換 /v1 に向けるときは via_gateway を false にする．
+base_url = "http://127.0.0.1:8000/v1"
+model = "auto"
+timeout_seconds = 120
+temperature = 0.7
+max_tokens = 800
+via_gateway = true
+gateway_mode = "fast"
+
+[karte]
+# auto は data_dir または KARTE_DATA_DIR がディレクトリなら Context Protocol v1，無ければ stub．
+mode = "auto"
+data_dir = ""
+timeout_seconds = 3
+poll_interval_seconds = 0.05
+projects = []
+tags = []
+sensitivity_ceiling = "internal"
+top_k = 5
+max_documents = 3
+actor_id = "ephy-discord"
+
+[cache]
+path = "data/ephy-discord.sqlite"
+dedupe_seconds = 600
+retention_days = 7
+
+[rate_limit]
+user_per_minute = 3
+channel_per_minute = 10
+window_seconds = 60
+
+[audit]
+path = "data/audit.jsonl"

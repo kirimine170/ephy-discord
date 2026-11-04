@@ -1,0 +1,3 @@
+"""Read-only Discord adapter for Ephy milestone O-1."""
+
+__version__ = "0.1.0"

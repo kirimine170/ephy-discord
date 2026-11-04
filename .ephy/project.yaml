@@ -1,0 +1,20 @@
+schema_version: 1
+
+project:
+  id: "ephy-discord"
+  family: "ephy"
+  type: "integration"
+  status: "active"
+  visibility: "public"
+  description: "Read-only Discord adapter for Ephy milestone O-1"
+
+relations:
+  parent: "ephy"
+  depends_on: ["ephy-runtime"]
+  integrates_with: ["karte"]
+  runs_on: []
+
+data_policy:
+  classification: "internal"
+  personal_data_in_git: "prohibited"
+  secrets_in_git: "prohibited"

@@ -1,0 +1,40 @@
+# ループバックのモック LLM に対するローカル確認用．Discord には接続しない．
+
+[discord]
+guild_id = 1
+allowed_channel_ids = [1]
+admin_user_ids = []
+
+[llm]
+base_url = "http://127.0.0.1:8765/v1"
+model = "mock"
+timeout_seconds = 10
+temperature = 0.7
+max_tokens = 200
+via_gateway = false
+gateway_mode = "fast"
+
+[karte]
+mode = "stub"
+data_dir = ""
+timeout_seconds = 1
+poll_interval_seconds = 0.05
+projects = []
+tags = []
+sensitivity_ceiling = "internal"
+top_k = 5
+max_documents = 3
+actor_id = "ephy-discord"
+
+[cache]
+path = "data/local-mock.sqlite"
+dedupe_seconds = 600
+retention_days = 7
+
+[rate_limit]
+user_per_minute = 30
+channel_per_minute = 60
+window_seconds = 60
+
+[audit]
+path = "data/local-mock-audit.jsonl"
