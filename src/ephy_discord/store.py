@@ -243,18 +243,41 @@ class Store:
         text: str,
         urls_json: str,
         provenance_json: str,
+        request_key: str | None = None,
+        body_sha256: str | None = None,
     ) -> None:
         now = format_time(self.clock.now())
         with self._lock:
             self._conn.execute(
                 """
                 INSERT INTO external_sources (
-                    id, created_at, origin, text, urls_json, provenance_json
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                    id, created_at, origin, text, urls_json, provenance_json,
+                    request_key, body_sha256
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (source_id, now, origin, text, urls_json, provenance_json),
+                (
+                    source_id,
+                    now,
+                    origin,
+                    text,
+                    urls_json,
+                    provenance_json,
+                    request_key,
+                    body_sha256,
+                ),
             )
             self._conn.commit()
+
+    def find_external_source(self, origin: str, request_key: str) -> dict | None:
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT id, body_sha256 FROM external_sources
+                WHERE origin = ? AND request_key = ?
+                """,
+                (origin, request_key),
+            ).fetchone()
+        return dict(row) if row else None
 
     def external_source_texts(self) -> list[str]:
         with self._lock:
@@ -486,8 +509,13 @@ class Store:
                     origin TEXT NOT NULL,
                     text TEXT NOT NULL,
                     urls_json TEXT NOT NULL,
-                    provenance_json TEXT NOT NULL
+                    provenance_json TEXT NOT NULL,
+                    request_key TEXT,
+                    body_sha256 TEXT
                 );
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_external_source_key
+                    ON external_sources(origin, request_key)
+                    WHERE request_key IS NOT NULL;
                 CREATE TABLE IF NOT EXISTS pending_actions (
                     id TEXT PRIMARY KEY,
                     created_at TEXT NOT NULL,

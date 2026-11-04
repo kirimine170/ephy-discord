@@ -7,26 +7,30 @@ toml enables it, and it stays on loopback so a tunnel is an explicit choice.
 
 from __future__ import annotations
 
-import base64
 import hashlib
 import hmac
 import json
 import secrets
 from dataclasses import dataclass
-from datetime import timedelta
-from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.parse import urlparse
 
 from aiohttp import web
 
-from ephy_discord.config import (
-    MCP_BEARER_ENV,
-    MCP_OAUTH_ENV,
-    AppConfig,
+from ephy_discord.config import MCP_BEARER_ENV, AppConfig
+from ephy_discord.oauth_resource import (
+    REQUIRED_SCOPE,
+    OAuthConfigurationError,
+    OAuthSettings,
+    load_oauth_settings,
+    protected_resource_metadata,
+    resource_metadata_url,
+    verify_access_token,
 )
 from ephy_discord.service import AdapterService, Turn
 from ephy_discord.store import Store, format_time
+from ephy_discord.tunnel_url import read_public_url
 
-PROTOCOL_VERSIONS = ("2025-06-18", "2025-03-26")
+PROTOCOL_VERSIONS = ("2026-07-28", "2025-06-18", "2025-03-26")
 ORIGINS = frozenset({"chatgpt", "grok", "muse", "other"})
 
 
@@ -40,21 +44,33 @@ class HttpResult:
 @dataclass(frozen=True)
 class McpSecrets:
     bearer_token: str
-    oauth_secret: str
+    oauth: OAuthSettings | None
+    oauth_error: str
 
 
-def load_mcp_secrets(environ: dict[str, str] | None = None) -> McpSecrets:
+def load_mcp_secrets(
+    environ: dict[str, str] | None = None,
+    *,
+    resource_url: str = "",
+) -> McpSecrets:
     source = environ if environ is not None else __import__("os").environ
+    oauth = None
+    error = ""
+    try:
+        oauth = load_oauth_settings(source, resource_url=resource_url)
+    except OAuthConfigurationError as exc:
+        error = str(exc)
     return McpSecrets(
         bearer_token=source.get(MCP_BEARER_ENV, "").strip(),
-        oauth_secret=source.get(MCP_OAUTH_ENV, "").strip(),
+        oauth=oauth,
+        oauth_error=error,
     )
 
 
 def mcp_can_listen(config: AppConfig, secrets: McpSecrets) -> bool:
     if not config.mcp.enabled:
         return False
-    return bool(secrets.bearer_token or secrets.oauth_secret)
+    return bool(secrets.bearer_token or secrets.oauth)
 
 
 class McpApp:
@@ -68,22 +84,28 @@ class McpApp:
         self.service = service
         self.store: Store = service.store
         self.secrets = secrets
-        self.public_base = config.mcp.public_base_url or (
+        self.public_base = read_public_url(config) or (
             f"http://{config.mcp.bind_host}:{config.mcp.port}"
         )
 
     async def handle(self, method: str, path: str, headers: dict, body: bytes) -> HttpResult:
+        host_error = _host_error(headers)
+        if host_error:
+            return _json({"error": host_error}, status=400)
+        if len(body) > 1_048_576:
+            return _json({"error": "BODY_TOO_LARGE"}, status=413)
         route = path.split("?", 1)[0].rstrip("/") or "/"
-        if route == "/.well-known/oauth-protected-resource" and method == "GET":
-            return _json(self._protected_resource())
-        if route == "/.well-known/oauth-authorization-server" and method == "GET":
-            return _json(self._authorization_server())
-        if route == "/oauth/register" and method == "POST":
-            return self._register(body)
-        if route == "/oauth/authorize" and method in {"GET", "POST"}:
-            return self._authorize(method, path, body)
-        if route == "/oauth/token" and method == "POST":
-            return self._token(body, headers)
+        if route == "/health" and method == "GET":
+            return _json({"ok": True, "runtime": "ephy-discord", "live_connectors": False})
+        if (
+            route
+            in {
+                "/.well-known/oauth-protected-resource",
+                "/.well-known/oauth-protected-resource/mcp",
+            }
+            and method == "GET"
+        ):
+            return self._protected_resource()
         if route == "/mcp" and method == "POST":
             return await self._mcp(headers, body)
         if route == "/mcp" and method == "GET":
@@ -92,16 +114,7 @@ class McpApp:
 
     async def _mcp(self, headers: dict, body: bytes) -> HttpResult:
         if not self._authorized(headers):
-            return _json(
-                {"error": "unauthorized"},
-                status=401,
-                extra={
-                    "WWW-Authenticate": (
-                        'Bearer resource_metadata="'
-                        f'{self.public_base}/.well-known/oauth-protected-resource"'
-                    )
-                },
-            )
+            return _json({"error": "unauthorized"}, status=401, extra=self._challenge())
         try:
             payload = json.loads(body.decode("utf-8"))
         except (UnicodeError, json.JSONDecodeError):
@@ -112,12 +125,11 @@ class McpApp:
         method = payload.get("method")
         params = payload.get("params") if isinstance(payload.get("params"), dict) else {}
         if method == "initialize":
-            requested = str(params.get("protocolVersion") or PROTOCOL_VERSIONS[0])
-            version = requested if requested in PROTOCOL_VERSIONS else PROTOCOL_VERSIONS[0]
+            requested = _protocol_version(headers, params)
             return _json_rpc(
                 request_id,
                 {
-                    "protocolVersion": version,
+                    "protocolVersion": requested,
                     "capabilities": {"tools": {"listChanged": False}},
                     "serverInfo": {"name": "ephy-discord", "version": "0.2.0"},
                     "instructions": (
@@ -206,11 +218,32 @@ class McpApp:
         urls = arguments.get("urls") if isinstance(arguments.get("urls"), list) else []
         clean_urls = []
         for url in urls[:10]:
-            if not isinstance(url, str) or not _public_http_url(url):
-                return _tool_error("urls must be http or https")
+            if not isinstance(url, str) or not _https_url(url):
+                return _tool_error("urls must be https")
             clean_urls.append(url.strip())
-        if not text or len(text) > 8000:
-            return _tool_error("text is required and must be at most 8000 characters")
+        if not text or len(text) > 6000:
+            return _tool_error("text is required and must be at most 6000 characters")
+        unknown = set(arguments) - {"text", "urls", "origin", "request_key"}
+        if unknown:
+            return _tool_error("invalid_input")
+        request_key = str(arguments.get("request_key") or "").strip()
+        body_hash = _sha256(text + "\n" + json.dumps(clean_urls, ensure_ascii=False))
+        if request_key:
+            existing = self.store.find_external_source(origin, request_key)
+            if existing is not None:
+                if existing["body_sha256"] != body_hash:
+                    return _tool_error("request_key_conflict")
+                return _tool_text(
+                    _dumps(
+                        {
+                            "source_id": existing["id"],
+                            "stored": "cache",
+                            "written_to_karte": False,
+                            "url_count": len(clean_urls),
+                            "idempotent": True,
+                        }
+                    )
+                )
         source_id = secrets.token_hex(16)
         provenance = {
             "connector": origin,
@@ -224,6 +257,8 @@ class McpApp:
             text=text,
             urls_json=json.dumps(clean_urls, ensure_ascii=False),
             provenance_json=json.dumps(provenance, ensure_ascii=False),
+            request_key=request_key or None,
+            body_sha256=body_hash,
         )
         self._audit(
             "source_submitted",
@@ -243,144 +278,27 @@ class McpApp:
             )
         )
 
-    def _register(self, body: bytes) -> HttpResult:
-        try:
-            payload = json.loads(body.decode("utf-8"))
-        except (UnicodeError, json.JSONDecodeError):
-            return _json({"error": "invalid_client_metadata"}, status=400)
-        redirects = payload.get("redirect_uris") if isinstance(payload, dict) else None
-        if not isinstance(redirects, list) or not redirects:
-            return _json({"error": "invalid_redirect_uri"}, status=400)
-        clean = []
-        for uri in redirects:
-            if not isinstance(uri, str) or not _allowed_redirect(uri):
-                return _json({"error": "invalid_redirect_uri"}, status=400)
-            clean.append(uri)
-        client_id = "ephy-" + secrets.token_hex(8)
-        client_secret = secrets.token_urlsafe(32)
-        self.store.save_oauth_client(
-            client_id,
-            _sha256(client_secret),
-            json.dumps(clean, ensure_ascii=False),
-        )
-        return _json(
-            {
-                "client_id": client_id,
-                "client_secret": client_secret,
-                "redirect_uris": clean,
-                "token_endpoint_auth_method": "client_secret_post",
-                "grant_types": ["authorization_code"],
-                "response_types": ["code"],
-            },
-            status=201,
-        )
-
-    def _authorize(self, method: str, path: str, body: bytes) -> HttpResult:
-        if method == "GET":
-            params = parse_qs(urlparse(path).query)
-            flat = {key: values[-1] for key, values in params.items()}
-        else:
-            flat = {key: values[-1] for key, values in parse_qs(body.decode("utf-8")).items()}
-        error = self._authorize_error(flat)
-        if error:
-            return _json({"error": error}, status=400)
-        if method == "GET" or not _same(flat.get("owner_secret", ""), self.secrets.oauth_secret):
-            return HttpResult(
-                200,
-                _authorize_page(flat).encode("utf-8"),
-                {"Content-Type": "text/html; charset=utf-8"},
-            )
-        code = secrets.token_urlsafe(32)
-        expires = format_time(self.store.clock.now() + timedelta(seconds=60))
-        self.store.save_oauth_code(
-            {
-                "code_hash": _sha256(code),
-                "client_id": flat["client_id"],
-                "redirect_uri": flat["redirect_uri"],
-                "challenge": flat["code_challenge"],
-                "expires_at": expires,
-            }
-        )
-        query = urlencode({"code": code, "state": flat.get("state", "")})
-        return HttpResult(302, b"", {"Location": f"{flat['redirect_uri']}?{query}"})
-
-    def _authorize_error(self, flat: dict) -> str:
-        if flat.get("response_type") != "code":
-            return "unsupported_response_type"
-        if flat.get("code_challenge_method") != "S256" or not flat.get("code_challenge"):
-            return "invalid_request"
-        client = self.store.get_oauth_client(flat.get("client_id", ""))
-        if client is None:
-            return "invalid_client"
-        redirects = json.loads(client["redirect_uris_json"])
-        if flat.get("redirect_uri") not in redirects:
-            return "invalid_redirect_uri"
-        if not self.secrets.oauth_secret:
-            return "oauth_disabled"
-        return ""
-
-    def _token(self, body: bytes, headers: dict) -> HttpResult:
-        form = {key: values[-1] for key, values in parse_qs(body.decode("utf-8")).items()}
-        if form.get("grant_type") != "authorization_code":
-            return _json({"error": "unsupported_grant_type"}, status=400)
-        client = self.store.get_oauth_client(form.get("client_id", ""))
-        presented = form.get("client_secret", "")
-        if client is None or not _same(_sha256(presented), client["secret_hash"]):
-            return _json({"error": "invalid_client"}, status=401)
-        now_iso = format_time(self.store.clock.now())
-        code_hash = _sha256(form.get("code", ""))
-        code = self.store.peek_oauth_code(code_hash, now_iso)
-        if code is None or code["client_id"] != client["client_id"]:
-            return _json({"error": "invalid_grant"}, status=400)
-        if code["redirect_uri"] != form.get("redirect_uri"):
-            return _json({"error": "invalid_grant"}, status=400)
-        verifier = form.get("code_verifier", "")
-        if not _same(_pkce(verifier), code["challenge"]):
-            return _json({"error": "invalid_grant"}, status=400)
-        if self.store.take_oauth_code(code_hash, now_iso) is None:
-            return _json({"error": "invalid_grant"}, status=400)
-        token = secrets.token_urlsafe(32)
-        expires = self.store.clock.now() + timedelta(seconds=self.config.mcp.token_ttl_seconds)
-        self.store.save_oauth_token(
-            token_hash=_sha256(token),
-            client_id=client["client_id"],
-            expires_at=format_time(expires),
-        )
-        del headers
-        return _json(
-            {
-                "access_token": token,
-                "token_type": "Bearer",
-                "expires_in": self.config.mcp.token_ttl_seconds,
-            }
-        )
-
     def _authorized(self, headers: dict) -> bool:
         presented = _bearer(headers)
         if not presented:
             return False
         if self.secrets.bearer_token and _same(presented, self.secrets.bearer_token):
             return True
-        return self.store.oauth_token_valid(_sha256(presented), format_time(self.store.clock.now()))
+        if self.secrets.oauth is None:
+            return False
+        return verify_access_token(presented, self.secrets.oauth)
 
-    def _protected_resource(self) -> dict:
-        return {
-            "resource": self.public_base,
-            "authorization_servers": [self.public_base],
-            "bearer_methods_supported": ["header"],
-            "scopes_supported": ["ephy:read", "ephy:submit"],
-        }
+    def _protected_resource(self) -> HttpResult:
+        if self.secrets.oauth is None:
+            return _json({"error": "OAUTH_NOT_CONFIGURED"}, status=503)
+        return _json(protected_resource_metadata(self.secrets.oauth))
 
-    def _authorization_server(self) -> dict:
+    def _challenge(self) -> dict[str, str]:
+        if self.secrets.oauth is None:
+            return {"WWW-Authenticate": "Bearer"}
+        metadata = resource_metadata_url(self.secrets.oauth.audience)
         return {
-            "issuer": self.public_base,
-            "authorization_endpoint": f"{self.public_base}/oauth/authorize",
-            "token_endpoint": f"{self.public_base}/oauth/token",
-            "registration_endpoint": f"{self.public_base}/oauth/register",
-            "response_types_supported": ["code"],
-            "grant_types_supported": ["authorization_code"],
-            "code_challenge_methods_supported": ["S256"],
-            "token_endpoint_auth_methods_supported": ["client_secret_post"],
+            "WWW-Authenticate": f'Bearer resource_metadata="{metadata}", scope="{REQUIRED_SCOPE}"'
         }
 
     def _audit(self, event: str, **fields) -> None:
@@ -450,28 +368,6 @@ def _tool_definitions() -> list[dict]:
     ]
 
 
-def _authorize_page(params: dict) -> str:
-    hidden = "".join(
-        f'<input type="hidden" name="{_escape(key)}" value="{_escape(params.get(key, ""))}">'
-        for key in (
-            "response_type",
-            "client_id",
-            "redirect_uri",
-            "code_challenge",
-            "code_challenge_method",
-            "state",
-        )
-    )
-    return (
-        '<!DOCTYPE html><html lang="ja"><meta charset="utf-8">'
-        "<title>ephy connector</title><body>"
-        "<p>コネクタに ephy の読み取りを許可します．合言葉を入力してください．</p>"
-        f'<form method="post" action="/oauth/authorize">{hidden}'
-        '<label>合言葉 <input type="password" name="owner_secret" autocomplete="off"></label>'
-        '<button type="submit">許可する</button></form></body></html>'
-    )
-
-
 def _bearer(headers: dict) -> str:
     raw = ""
     for key, value in headers.items():
@@ -491,11 +387,6 @@ def _client_label(headers: dict, secrets: McpSecrets) -> str:
     return "oauth"
 
 
-def _pkce(verifier: str) -> str:
-    digest = hashlib.sha256(verifier.encode("ascii")).digest()
-    return base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
-
-
 def _same(left: str, right: str) -> bool:
     if len(left) != len(right):
         return False
@@ -506,18 +397,35 @@ def _sha256(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
-def _allowed_redirect(uri: str) -> bool:
-    parsed = urlparse(uri)
-    if parsed.username or parsed.query or parsed.fragment:
-        return False
-    if parsed.scheme == "https" and parsed.hostname:
-        return True
-    return parsed.scheme == "http" and parsed.hostname in {"127.0.0.1", "localhost", "::1"}
-
-
-def _public_http_url(url: str) -> bool:
+def _https_url(url: str) -> bool:
     parsed = urlparse(url.strip())
-    return parsed.scheme in {"http", "https"} and bool(parsed.hostname)
+    return parsed.scheme == "https" and bool(parsed.hostname) and not parsed.username
+
+
+def _host_error(headers: dict) -> str:
+    host = ""
+    for key, value in headers.items():
+        if key.lower() == "host":
+            host = value
+            break
+    if not host:
+        return ""
+    name = host.rsplit(":", 1)[0].strip("[]")
+    if name not in {"127.0.0.1", "localhost", "::1"}:
+        return "INVALID_HOST"
+    return ""
+
+
+def _protocol_version(headers: dict, params: dict) -> str:
+    header = ""
+    for key, value in headers.items():
+        if key.lower() == "mcp-protocol-version":
+            header = value
+            break
+    requested = header or str(params.get("protocolVersion") or PROTOCOL_VERSIONS[1])
+    if requested in PROTOCOL_VERSIONS:
+        return requested
+    return PROTOCOL_VERSIONS[1]
 
 
 def _clip(text: str, limit: int = 180) -> str:
@@ -554,12 +462,6 @@ def _json_rpc_error(request_id, code: int, message: str) -> HttpResult:
     return _json(
         {"jsonrpc": "2.0", "id": request_id, "error": {"code": code, "message": message}},
         status=400,
-    )
-
-
-def _escape(value: str) -> str:
-    return (
-        value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
     )
 
 

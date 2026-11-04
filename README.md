@@ -154,7 +154,7 @@ python -m ephy_discord run --config /path/to/ephy-discord.toml
 | `mcp.bind_host` | `127.0.0.1` | ループバックだけ |
 | `mcp.port` | `8791` | オーケストレータと重なったら変える |
 | `mcp.public_base_url` | 空 | トンネルの https URL．Git に入れない |
-| `mcp.token_ttl_seconds` | `3600` | OAuth アクセストークンの寿命 |
+| `mcp.token_ttl_seconds` | `3600` | 未使用．トークン寿命は外部 IdP が持つ |
 | `approval.expiry_seconds` | `900` | 承認ボタンの期限 |
 
 トークンの変数名は `DISCORD_BOT_TOKEN` 固定である．

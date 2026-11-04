@@ -12,6 +12,7 @@ dependencies = [
   "aiohttp>=3.9,<4",
   "discord.py>=2.4,<3",
   "httpx>=0.28,<0.29",
+  "PyJWT[crypto]>=2.10,<3",
 ]
 
 [project.optional-dependencies]

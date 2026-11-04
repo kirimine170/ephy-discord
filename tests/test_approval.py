@@ -71,6 +71,22 @@ async def test_stub_approval_does_not_send_and_expiry_blocks_decision(tmp_path) 
     await press_approval(bot, late, reply["id"], "approved")
     assert late.channel.sent == []
     assert "期限切れ" in late.response.messages[0]
+
+    failing = queue.propose(
+        guild_id=1,
+        channel_id=10,
+        requester_user_id=3,
+        kind="reply",
+        payload={"text": "届いたか不明"},
+    )
+    broken = _interaction(user_id=7, channel_id=10)
+    broken.channel = _BrokenChannel()
+    await press_approval(bot, broken, failing["id"], "approved")
+    assert broken.channel.sent == []
+    assert "再送しません" in broken.response.messages[0]
+    again = _interaction(user_id=7, channel_id=10)
+    await press_approval(bot, again, failing["id"], "approved")
+    assert again.channel.sent == []
     await service.aclose()
 
 
@@ -100,6 +116,15 @@ class _Channel:
     async def send(self, content, **kwargs) -> None:
         del kwargs
         self.sent.append(content)
+
+
+class _BrokenChannel(_Channel):
+    def __init__(self) -> None:
+        super().__init__(10)
+
+    async def send(self, content, **kwargs) -> None:
+        del content, kwargs
+        raise RuntimeError("unknown")
 
 
 class _Response:

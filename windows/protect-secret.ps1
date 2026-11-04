@@ -1,31 +1,41 @@
-# Encrypt one ephy-discord secret with Windows DPAPI (CurrentUser).
-# The value is read from the console, never from an argument or a file in git.
+# Merge one secret into %LOCALAPPDATA%\ephy-discord\secrets.dpapi.
+# Current-user DPAPI only. The value is read from the console, never from argv.
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet("DISCORD_BOT_TOKEN", "EPHY_MCP_BEARER_TOKEN", "EPHY_MCP_OAUTH_SECRET")]
+    [ValidateSet("DISCORD_BOT_TOKEN", "EPHY_MCP_BEARER_TOKEN")]
     [string]$Name
 )
-
 $ErrorActionPreference = "Stop"
-Add-Type -AssemblyName System.Security
-$directory = Join-Path $env:LOCALAPPDATA "ephy-discord\secrets"
+Set-StrictMode -Version 2.0
+$directory = Join-Path $env:LOCALAPPDATA "ephy-discord"
 New-Item -ItemType Directory -Force -Path $directory | Out-Null
-$secure = Read-Host -AsSecureString -Prompt $Name
-$bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
+$path = Join-Path $directory "secrets.dpapi"
+$values = @{}
+if (Test-Path -LiteralPath $path) {
+    $secure = ConvertTo-SecureString -String ([IO.File]::ReadAllText($path))
+    try {
+        $plain = [Net.NetworkCredential]::new("", $secure).Password
+        $obj = $plain | ConvertFrom-Json
+        foreach ($property in $obj.PSObject.Properties) {
+            if ($property.Name -notin @("DISCORD_BOT_TOKEN", "EPHY_MCP_BEARER_TOKEN")) {
+                throw "SECRET_FILE_INVALID"
+            }
+            $values[$property.Name] = [string]$property.Value
+        }
+    }
+    finally {
+        $secure.Dispose()
+        $plain = $null
+    }
+}
+$entered = Read-Host -AsSecureString -Prompt $Name
 try {
-    $plain = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
-    $bytes = [Text.Encoding]::UTF8.GetBytes($plain)
+    $values[$Name] = [Net.NetworkCredential]::new("", $entered).Password
+    $encoded = ConvertTo-SecureString -String ($values | ConvertTo-Json -Compress) -AsPlainText -Force | ConvertFrom-SecureString
+    [IO.File]::WriteAllText($path, $encoded, [Text.UTF8Encoding]::new($false))
 }
 finally {
-    [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
-    $plain = $null
+    $entered.Dispose()
+    $values.Clear()
 }
-$protected = [Security.Cryptography.ProtectedData]::Protect(
-    $bytes,
-    $null,
-    [Security.Cryptography.DataProtectionScope]::CurrentUser
-)
-[Array]::Clear($bytes, 0, $bytes.Length)
-$destination = Join-Path $directory ($Name + ".dpapi")
-[IO.File]::WriteAllBytes($destination, $protected)
 Write-Output ("protected " + $Name)

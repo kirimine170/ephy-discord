@@ -5,7 +5,7 @@ import json
 import pytest
 
 from ephy_discord.config import McpConfig
-from ephy_discord.mcp import McpApp, McpSecrets, _pkce, mcp_can_listen
+from ephy_discord.mcp import McpApp, McpSecrets, mcp_can_listen
 from tests.conftest import make_config, make_service
 
 
@@ -23,23 +23,19 @@ def _app(tmp_path, *, bearer="static-token", oauth_secret="owner-secret"):
             token_ttl_seconds=3600,
         ),
     )
-    app = McpApp(service.config, service, McpSecrets(bearer, oauth_secret))
+    app = McpApp(service.config, service, McpSecrets(bearer, None, ""))
     return app, service, llm, karte
 
 
 def test_mcp_is_disabled_until_enabled_with_a_secret(tmp_path) -> None:
     config = make_config(tmp_path)
     assert config.mcp.enabled is False
-    assert mcp_can_listen(config, McpSecrets("", "")) is False
-    enabled = make_config(tmp_path)
+    assert mcp_can_listen(config, McpSecrets("", None, "")) is False
     from dataclasses import replace
 
-    enabled = replace(
-        enabled,
-        mcp=McpConfig(True, "127.0.0.1", 8791, "", 3600),
-    )
-    assert mcp_can_listen(enabled, McpSecrets("", "")) is False
-    assert mcp_can_listen(enabled, McpSecrets("token", "")) is True
+    enabled = replace(config, mcp=McpConfig(True, "127.0.0.1", 8791, "", 3600))
+    assert mcp_can_listen(enabled, McpSecrets("", None, "")) is False
+    assert mcp_can_listen(enabled, McpSecrets("token", None, "")) is True
 
 
 @pytest.mark.asyncio
@@ -73,7 +69,11 @@ async def test_mcp_tools_require_bearer_and_do_not_write_karte(tmp_path) -> None
     )
     denied = await app.handle("POST", "/mcp", {}, b"{}")
     assert denied.status == 401
-    assert "oauth-protected-resource" in denied.headers["WWW-Authenticate"]
+    assert denied.headers["WWW-Authenticate"] == "Bearer"
+    health = await app.handle("GET", "/health", {}, b"")
+    assert json.loads(health.body)["live_connectors"] is False
+    foreign = await app.handle("GET", "/health", {"Host": "evil.example"}, b"")
+    assert foreign.status == 400
 
     headers = {"Authorization": "Bearer static-token"}
     listed = await app.handle(
@@ -119,90 +119,149 @@ async def test_mcp_tools_require_bearer_and_do_not_write_karte(tmp_path) -> None
 
 
 @pytest.mark.asyncio
-async def test_oauth_pkce_issues_a_bearer_and_rejects_a_bad_verifier(tmp_path) -> None:
-    app, service, _llm, _karte = _app(tmp_path, bearer="")
-    registered = await app.handle(
-        "POST",
-        "/oauth/register",
-        {},
-        json.dumps({"redirect_uris": ["https://chatgpt.com/connector/oauth/callback"]}).encode(),
-    )
-    client = json.loads(registered.body)
-    verifier = "a" * 50
-    challenge = _pkce(verifier)
-    form = {
-        "response_type": "code",
-        "client_id": client["client_id"],
-        "redirect_uri": client["redirect_uris"][0],
-        "code_challenge": challenge,
-        "code_challenge_method": "S256",
-        "state": "xyz",
-        "owner_secret": "owner-secret",
-    }
-    approved = await app.handle("POST", "/oauth/authorize", {}, _form(form))
-    assert approved.status == 302
-    location = approved.headers["Location"]
-    code = location.split("code=", 1)[1].split("&", 1)[0]
-    bad = await app.handle(
-        "POST",
-        "/oauth/token",
-        {},
-        _form(
-            {
-                "grant_type": "authorization_code",
-                "code": code,
-                "code_verifier": "b" * 50,
-                "client_id": client["client_id"],
-                "client_secret": client["client_secret"],
-                "redirect_uri": client["redirect_uris"][0],
-            }
-        ),
-    )
-    assert bad.status == 400
+async def test_connector_jwt_is_checked_with_pinned_keys(tmp_path) -> None:
+    import jwt
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from jwt.algorithms import RSAAlgorithm
 
-    approved_again = await app.handle("POST", "/oauth/authorize", {}, _form(form))
-    code = approved_again.headers["Location"].split("code=", 1)[1].split("&", 1)[0]
-    good = await app.handle(
-        "POST",
-        "/oauth/token",
-        {},
-        _form(
-            {
-                "grant_type": "authorization_code",
-                "code": code,
-                "code_verifier": verifier,
-                "client_id": client["client_id"],
-                "client_secret": client["client_secret"],
-                "redirect_uri": client["redirect_uris"][0],
-            }
-        ),
+    resource = "https://example.test/ephy"
+    issuer = "https://issuer.example/realms/ephy"
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    jwk = json.loads(RSAAlgorithm.to_jwk(key.public_key()))
+    jwk["kid"] = "test"
+    private = json.loads(RSAAlgorithm.to_jwk(key))
+    assert "d" in private
+    app, service, _llm, _karte = _app(tmp_path, bearer="")
+    from ephy_discord.oauth_resource import OAuthSettings
+
+    app.secrets = McpSecrets(
+        "",
+        OAuthSettings(issuer, resource, {"keys": [jwk]}),
+        "",
     )
-    token = json.loads(good.body)["access_token"]
+    import time
+
+    now = int(time.time())
+    token = jwt.encode(
+        {
+            "sub": "connector-user",
+            "iss": issuer,
+            "aud": resource,
+            "iat": now,
+            "exp": now + 600,
+            "scope": "ephy:read",
+            "azp": "chatgpt",
+        },
+        key,
+        algorithm="RS256",
+        headers={"kid": "test"},
+    )
     called = await app.handle(
         "POST",
         "/mcp",
-        {"Authorization": f"Bearer {token}"},
+        {"Authorization": f"Bearer {token}", "MCP-Protocol-Version": "2026-07-28"},
         json.dumps(
             {
                 "jsonrpc": "2.0",
                 "id": 2,
-                "method": "tools/call",
-                "params": {"name": "discord_summary", "arguments": {}},
+                "method": "initialize",
+                "params": {"protocolVersion": "2025-03-26"},
             }
         ).encode(),
     )
-    assert called.status == 200
-    metadata = await app.handle("GET", "/.well-known/oauth-authorization-server", {}, b"")
+    assert json.loads(called.body)["result"]["protocolVersion"] == "2026-07-28"
+    missing_scope = jwt.encode(
+        {
+            "sub": "connector-user",
+            "iss": issuer,
+            "aud": resource,
+            "iat": now,
+            "exp": now + 600,
+            "scope": "other",
+            "azp": "chatgpt",
+        },
+        key,
+        algorithm="RS256",
+        headers={"kid": "test"},
+    )
+    rejected = await app.handle(
+        "POST",
+        "/mcp",
+        {"Authorization": f"Bearer {missing_scope}"},
+        json.dumps({"jsonrpc": "2.0", "id": 3, "method": "tools/list"}).encode(),
+    )
+    assert rejected.status == 401
+    assert "/.well-known/oauth-protected-resource/mcp" in rejected.headers["WWW-Authenticate"]
+    metadata = await app.handle("GET", "/.well-known/oauth-protected-resource/mcp", {}, b"")
     body = json.loads(metadata.body)
-    assert body["code_challenge_methods_supported"] == ["S256"]
-    assert body["registration_endpoint"].endswith("/oauth/register")
+    assert body["authorization_servers"] == [issuer]
+    assert body["scopes_supported"] == ["ephy:read"]
+    from ephy_discord.oauth_resource import OAuthConfigurationError, load_oauth_settings
+
+    try:
+        load_oauth_settings(
+            {
+                "EPHY_MCP_OAUTH_ISSUER": issuer,
+                "EPHY_MCP_OAUTH_AUDIENCE": resource,
+                "EPHY_MCP_OAUTH_JWKS": json.dumps({"keys": [private]}),
+            },
+            resource_url=resource,
+        )
+    except OAuthConfigurationError:
+        pass
+    else:
+        raise AssertionError("private jwk was accepted")
     await service.aclose()
 
 
-def _form(values: dict) -> bytes:
-    from urllib.parse import urlencode
-
-    return urlencode(values).encode()
+@pytest.mark.asyncio
+async def test_submit_sources_is_idempotent_and_https_only(tmp_path) -> None:
+    app, service, _llm, karte = _app(tmp_path)
+    headers = {"Authorization": "Bearer static-token"}
+    first = await _call(
+        app,
+        headers,
+        "submit_sources",
+        {
+            "origin": "chatgpt",
+            "text": "finding",
+            "urls": ["https://example.com/a"],
+            "request_key": "same",
+        },
+    )
+    second = await _call(
+        app,
+        headers,
+        "submit_sources",
+        {
+            "origin": "chatgpt",
+            "text": "finding",
+            "urls": ["https://example.com/a"],
+            "request_key": "same",
+        },
+    )
+    assert json.loads(first)["source_id"] == json.loads(second)["source_id"]
+    conflict = await _call(
+        app,
+        headers,
+        "submit_sources",
+        {
+            "origin": "chatgpt",
+            "text": "different",
+            "urls": ["https://example.com/a"],
+            "request_key": "same",
+        },
+    )
+    assert conflict == "request_key_conflict"
+    http_url = await _call(
+        app,
+        headers,
+        "submit_sources",
+        {"origin": "muse", "text": "no", "urls": ["http://example.com/a"]},
+    )
+    assert http_url == "urls must be https"
+    assert karte.queries == []
+    await service.aclose()
 
 
 async def _call(app: McpApp, headers: dict, name: str, arguments: dict) -> str:

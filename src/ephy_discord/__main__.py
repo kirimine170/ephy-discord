@@ -12,7 +12,6 @@ from ephy_discord import __version__
 from ephy_discord.bot import EphyDiscordBot, build_intents, minimal_permissions
 from ephy_discord.config import (
     MCP_BEARER_ENV,
-    MCP_OAUTH_ENV,
     TOKEN_ENV,
     load_config,
     read_bot_token,
@@ -21,6 +20,7 @@ from ephy_discord.config import (
 from ephy_discord.mock_llm import serve
 from ephy_discord.permissions import minimal_permission_value
 from ephy_discord.service import Turn, build_service
+from ephy_discord.tunnel_url import read_public_url, write_public_url
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -42,6 +42,13 @@ def main(argv: list[str] | None = None) -> int:
     mock.add_argument("--host", default="127.0.0.1")
     mock.add_argument("--port", type=int, default=8765)
 
+    mcp_url = sub.add_parser("mcp-url", help="record the current tunnel https origin")
+    mcp_url.add_argument("--config", required=True)
+    mcp_url_sub = mcp_url.add_subparsers(dest="mcp_action", required=True)
+    mcp_url_sub.add_parser("show")
+    mcp_set = mcp_url_sub.add_parser("set")
+    mcp_set.add_argument("url")
+
     args = parser.parse_args(argv)
     if args.command == "mock-llm":
         serve(args.host, args.port)
@@ -52,6 +59,8 @@ def main(argv: list[str] | None = None) -> int:
         return asyncio.run(_answer(args.config, args.text))
     if args.command == "run":
         return _run(args.config)
+    if args.command == "mcp-url":
+        return _mcp_url(args)
     return 2
 
 
@@ -72,7 +81,9 @@ def _check(path: str) -> int:
         f"approvers={len(config.approver_user_ids)}"
     )
     print(f"{MCP_BEARER_ENV}={'set' if os.environ.get(MCP_BEARER_ENV, '').strip() else 'unset'}")
-    print(f"{MCP_OAUTH_ENV}={'set' if os.environ.get(MCP_OAUTH_ENV, '').strip() else 'unset'}")
+    issuer_set = bool(os.environ.get("EPHY_MCP_OAUTH_ISSUER", "").strip())
+    print(f"EPHY_MCP_OAUTH_ISSUER={'set' if issuer_set else 'unset'}")
+    print("orchestrator_port=18640 ephy_mcp_port=8791")
     print(f"intents={intents.value} permissions={minimal_permissions().value}")
     print(f"permission_bits={minimal_permission_value()}")
     print(f"{TOKEN_ENV}={'set' if token_set else 'unset'}")
@@ -101,6 +112,19 @@ async def _answer(path: str, text: str) -> int:
         return 0
     print(result.kind, file=sys.stderr)
     return 1
+
+
+def _mcp_url(args) -> int:
+    config = load_config(args.config)
+    if args.mcp_action == "show":
+        print(read_public_url(config) or "unset")
+        return 0
+    try:
+        print(write_public_url(config, args.url))
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    return 0
 
 
 def _run(path: str) -> int:

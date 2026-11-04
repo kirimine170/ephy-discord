@@ -26,6 +26,7 @@ from ephy_discord.permissions import (
 from ephy_discord.service import AdapterService
 from ephy_discord.store import format_time
 from ephy_discord.text import extract_question, split_discord_text
+from ephy_discord.tunnel_url import read_public_url
 
 log = logging.getLogger(__name__)
 
@@ -138,7 +139,9 @@ class EphyDiscordBot(discord.Client):
         await self._maybe_start_mcp()
 
     async def _maybe_start_mcp(self) -> None:
-        secrets = load_mcp_secrets()
+        secrets = load_mcp_secrets(resource_url=read_public_url(self.config))
+        if secrets.oauth_error:
+            log.error("mcp oauth configuration rejected: %s", secrets.oauth_error)
         if not mcp_can_listen(self.config, secrets):
             if self.config.mcp.enabled:
                 log.error("mcp is enabled but no bearer token or oauth secret is set")
@@ -343,6 +346,33 @@ async def press_approval(
     decision: str,
 ) -> None:
     result = bot.approvals.decide(action_id, interaction.user.id, decision)
+    posted = False
+    unknown = False
+    if result.status == "approved" and result.kind == REAL_KIND and result.reply_text:
+        channel = interaction.channel
+        allowed = channel is not None and bot.config.allowlist.permits(
+            interaction.guild_id, getattr(channel, "id", None)
+        )
+        if not allowed:
+            unknown = True
+        else:
+            try:
+                await channel.send(
+                    result.reply_text,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+                posted = True
+            except Exception:
+                unknown = True
+        if unknown:
+            bot.approvals.mark_post_unknown(action_id)
+            result = type(result)(
+                status="post_unknown",
+                kind=result.kind,
+                text="投稿結果が不明です．再送しません．",
+                action_id=action_id,
+            )
+        del posted
     bot.service.audit.write(
         {
             "ts": format_time(bot.service.store.clock.now()),
@@ -353,19 +383,9 @@ async def press_approval(
             "action_id": action_id,
             "action_kind": result.kind,
             "decision": result.status,
+            "reason": "POST_UNKNOWN" if result.status == "post_unknown" else None,
         }
     )
-    if (
-        result.status == "approved"
-        and result.kind == REAL_KIND
-        and result.reply_text
-        and interaction.channel is not None
-        and bot.config.allowlist.permits(interaction.guild_id, interaction.channel.id)
-    ):
-        await interaction.channel.send(
-            result.reply_text,
-            allowed_mentions=discord.AllowedMentions.none(),
-        )
     if interaction.response.is_done():
         await interaction.followup.send(result.text, ephemeral=result.status == "forbidden")
     else:

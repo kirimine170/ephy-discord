@@ -133,3 +133,11 @@ class ApprovalQueue:
             text=STUB_ACK,
             action_id=action_id,
         )
+
+    def mark_post_unknown(self, action_id: str) -> None:
+        self.store.save_action_status(
+            action_id,
+            status="post_unknown",
+            decided_by=None,
+            decided_at=format_time(self.store.clock.now()),
+        )
