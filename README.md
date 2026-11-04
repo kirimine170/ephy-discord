@@ -11,7 +11,11 @@ ephy の Discord アダプタである．O-1 は読み取り専用ボットで�
 3. 無ければ Karte Context Protocol v1 で search し，上位の文書を read する．Karte が無ければ stub として，個人コンテキスト無しで答える．
 4. ephy-runtime の Gateway，または llama.cpp の OpenAI 互換 `/v1/chat/completions` へ送る．URL はループバックだけを許す．
 
-Grok，OpenAI，その他の外部 API は呼ばない．返信以外の投稿や操作もしない．
+Grok，OpenAI，その他の外部 API は呼ばない．コネクタ（ChatGPT，Grok，Muse）からの呼び出しは，人がそれぞれのチャット画面で始めたときだけ MCP で受ける．詳しくは [docs/mcp.md](docs/mcp.md)．
+
+承認が必要な外向き操作は [docs/approval.md](docs/approval.md)．今実行するのは，承認された返信だけである．
+
+GTX 1050 の Windows ノートで議会ボットと並べる手順は [docs/windows.md](docs/windows.md)．MCP の既定ポートは `8791` である．
 
 `ephy-worker` の `discord-runtime` は，Runtime の公開検索へ質問を渡す別の transport である．このリポジトリはそれを起動しない．Discord アプリケーションは分ける．
 
@@ -145,6 +149,13 @@ python -m ephy_discord run --config /path/to/ephy-discord.toml
 | `rate_limit.channel_per_minute` | `10` | 同ウィンドウのチャンネル上限 |
 | `rate_limit.window_seconds` | `60` | |
 | `audit.path` | `data/audit.jsonl` | |
+| `discord.approver_user_ids` | `[]` | 承認ボタンを押せるユーザー．空なら提案を受け付けない |
+| `mcp.enabled` | `false` | true のときだけ MCP を待つ |
+| `mcp.bind_host` | `127.0.0.1` | ループバックだけ |
+| `mcp.port` | `8791` | オーケストレータと重なったら変える |
+| `mcp.public_base_url` | 空 | トンネルの https URL．Git に入れない |
+| `mcp.token_ttl_seconds` | `3600` | 未使用．トークン寿命は外部 IdP が持つ |
+| `approval.expiry_seconds` | `900` | 承認ボタンの期限 |
 
 トークンの変数名は `DISCORD_BOT_TOKEN` 固定である．
 

@@ -163,7 +163,7 @@ async def test_discord_mentions_and_slash_commands_stay_inside_the_allowlist(tmp
     assert stop.response.messages == [STOP_ACK]
 
     names = command_names(build_command_group(SimpleNamespace(config=config, service=service)))
-    assert names == ["ask", "forget", "purge", "stop"]
+    assert names == ["ask", "forget", "propose", "purge", "stop"]
     await service.aclose()
 
 

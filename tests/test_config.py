@@ -19,6 +19,9 @@ def test_example_configs_load() -> None:
     assert example.cache.retention_days == 7
     assert example.rate_limit.user_per_minute == 3
     assert example.rate_limit.channel_per_minute == 10
+    assert example.mcp.enabled is False
+    assert example.mcp.port == 8791
+    assert example.approver_user_ids == frozenset()
     assert mock.karte.mode == "stub"
     assert mock.llm.via_gateway is False
 

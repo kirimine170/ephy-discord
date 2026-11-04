@@ -89,6 +89,11 @@ class Store:
                 (cutoff,),
             ).rowcount
             self._conn.execute("DELETE FROM rate_events WHERE created_at <= ?", (rate_cutoff,))
+            self._conn.execute("DELETE FROM external_sources WHERE created_at <= ?", (cutoff,))
+            self._conn.execute(
+                "DELETE FROM pending_actions WHERE created_at <= ? AND status != 'pending'",
+                (cutoff,),
+            )
             self._conn.commit()
             if vacuum and deleted:
                 self._conn.execute("VACUUM")
@@ -203,9 +208,256 @@ class Store:
             self._conn.execute("UPDATE messages SET query_text = NULL, answer_text = NULL")
             self._conn.execute("DELETE FROM messages")
             self._conn.execute("DELETE FROM rate_events")
+            self._conn.execute("DELETE FROM external_sources")
+            self._conn.execute("DELETE FROM pending_actions")
+            self._conn.execute("DELETE FROM oauth_clients")
+            self._conn.execute("DELETE FROM oauth_codes")
+            self._conn.execute("DELETE FROM oauth_tokens")
             self._conn.commit()
             self._conn.execute("VACUUM")
             return count
+
+    def recent_messages(self, channel_ids: list[str], limit: int = 20) -> list[dict]:
+        if not channel_ids or limit < 1:
+            return []
+        placeholders = ",".join("?" for _ in channel_ids)
+        with self._lock:
+            rows = self._conn.execute(
+                f"""
+                SELECT created_at, channel_id, user_id, query_text, answer_text
+                FROM messages
+                WHERE channel_id IN ({placeholders})
+                  AND (query_text IS NOT NULL OR answer_text IS NOT NULL)
+                ORDER BY created_at DESC, id DESC
+                LIMIT ?
+                """,
+                (*channel_ids, limit),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def add_external_source(
+        self,
+        *,
+        source_id: str,
+        origin: str,
+        text: str,
+        urls_json: str,
+        provenance_json: str,
+        request_key: str | None = None,
+        body_sha256: str | None = None,
+    ) -> None:
+        now = format_time(self.clock.now())
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO external_sources (
+                    id, created_at, origin, text, urls_json, provenance_json,
+                    request_key, body_sha256
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    source_id,
+                    now,
+                    origin,
+                    text,
+                    urls_json,
+                    provenance_json,
+                    request_key,
+                    body_sha256,
+                ),
+            )
+            self._conn.commit()
+
+    def find_external_source(self, origin: str, request_key: str) -> dict | None:
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT id, body_sha256 FROM external_sources
+                WHERE origin = ? AND request_key = ?
+                """,
+                (origin, request_key),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def external_source_texts(self) -> list[str]:
+        with self._lock:
+            rows = self._conn.execute("SELECT text FROM external_sources").fetchall()
+        return [str(row["text"]) for row in rows]
+
+    def insert_action(self, row: dict) -> None:
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO pending_actions (
+                    id, created_at, expires_at, guild_id, channel_id, requester_user_id,
+                    kind, payload_json, status, decided_by, decided_at, message_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    row["id"],
+                    row["created_at"],
+                    row["expires_at"],
+                    row["guild_id"],
+                    row["channel_id"],
+                    row["requester_user_id"],
+                    row["kind"],
+                    row["payload_json"],
+                    row["status"],
+                    row.get("decided_by"),
+                    row.get("decided_at"),
+                    row.get("message_id"),
+                ),
+            )
+            self._conn.commit()
+
+    def get_action(self, action_id: str) -> dict | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM pending_actions WHERE id = ?",
+                (action_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def save_action_status(
+        self,
+        action_id: str,
+        *,
+        status: str,
+        decided_by: str | None,
+        decided_at: str | None,
+        message_id: str | None = None,
+    ) -> None:
+        with self._lock:
+            if message_id is None:
+                self._conn.execute(
+                    """
+                    UPDATE pending_actions
+                    SET status = ?, decided_by = ?, decided_at = ?
+                    WHERE id = ?
+                    """,
+                    (status, decided_by, decided_at, action_id),
+                )
+            else:
+                self._conn.execute(
+                    "UPDATE pending_actions SET message_id = ? WHERE id = ?",
+                    (message_id, action_id),
+                )
+            self._conn.commit()
+
+    def pending_actions(self) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM pending_actions WHERE status = 'pending' ORDER BY created_at"
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def expire_actions(self, now_iso: str) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT * FROM pending_actions
+                WHERE status = 'pending' AND expires_at <= ?
+                """,
+                (now_iso,),
+            ).fetchall()
+            expired = [dict(row) for row in rows]
+            if expired:
+                self._conn.execute(
+                    """
+                    UPDATE pending_actions
+                    SET status = 'expired', decided_at = ?
+                    WHERE status = 'pending' AND expires_at <= ?
+                    """,
+                    (now_iso, now_iso),
+                )
+                self._conn.commit()
+        return expired
+
+    def save_oauth_client(self, client_id: str, secret_hash: str, redirect_uris_json: str) -> None:
+        now = format_time(self.clock.now())
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO oauth_clients (client_id, secret_hash, redirect_uris_json, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (client_id, secret_hash, redirect_uris_json, now),
+            )
+            self._conn.commit()
+
+    def get_oauth_client(self, client_id: str) -> dict | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM oauth_clients WHERE client_id = ?",
+                (client_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def save_oauth_code(self, row: dict) -> None:
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO oauth_codes (
+                    code_hash, client_id, redirect_uri, challenge, expires_at, used
+                ) VALUES (?, ?, ?, ?, ?, 0)
+                """,
+                (
+                    row["code_hash"],
+                    row["client_id"],
+                    row["redirect_uri"],
+                    row["challenge"],
+                    row["expires_at"],
+                ),
+            )
+            self._conn.commit()
+
+    def peek_oauth_code(self, code_hash: str, now_iso: str) -> dict | None:
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT * FROM oauth_codes
+                WHERE code_hash = ? AND used = 0 AND expires_at > ?
+                """,
+                (code_hash, now_iso),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def take_oauth_code(self, code_hash: str, now_iso: str) -> dict | None:
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT * FROM oauth_codes
+                WHERE code_hash = ? AND used = 0 AND expires_at > ?
+                """,
+                (code_hash, now_iso),
+            ).fetchone()
+            if row is None:
+                return None
+            self._conn.execute("UPDATE oauth_codes SET used = 1 WHERE code_hash = ?", (code_hash,))
+            self._conn.commit()
+        return dict(row)
+
+    def save_oauth_token(self, token_hash: str, client_id: str, expires_at: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO oauth_tokens (token_hash, client_id, expires_at)
+                VALUES (?, ?, ?)
+                """,
+                (token_hash, client_id, expires_at),
+            )
+            self._conn.commit()
+
+    def oauth_token_valid(self, token_hash: str, now_iso: str) -> bool:
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT 1 FROM oauth_tokens
+                WHERE token_hash = ? AND expires_at > ?
+                """,
+                (token_hash, now_iso),
+            ).fetchone()
+        return row is not None
 
     def message_texts(self) -> list[str]:
         with self._lock:
@@ -251,6 +503,52 @@ class Store:
                     ON rate_events(user_id, created_at);
                 CREATE INDEX IF NOT EXISTS idx_rate_channel
                     ON rate_events(channel_id, created_at);
+                CREATE TABLE IF NOT EXISTS external_sources (
+                    id TEXT PRIMARY KEY,
+                    created_at TEXT NOT NULL,
+                    origin TEXT NOT NULL,
+                    text TEXT NOT NULL,
+                    urls_json TEXT NOT NULL,
+                    provenance_json TEXT NOT NULL,
+                    request_key TEXT,
+                    body_sha256 TEXT
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_external_source_key
+                    ON external_sources(origin, request_key)
+                    WHERE request_key IS NOT NULL;
+                CREATE TABLE IF NOT EXISTS pending_actions (
+                    id TEXT PRIMARY KEY,
+                    created_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    guild_id TEXT NOT NULL,
+                    channel_id TEXT NOT NULL,
+                    requester_user_id TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    decided_by TEXT,
+                    decided_at TEXT,
+                    message_id TEXT
+                );
+                CREATE TABLE IF NOT EXISTS oauth_clients (
+                    client_id TEXT PRIMARY KEY,
+                    secret_hash TEXT NOT NULL,
+                    redirect_uris_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS oauth_codes (
+                    code_hash TEXT PRIMARY KEY,
+                    client_id TEXT NOT NULL,
+                    redirect_uri TEXT NOT NULL,
+                    challenge TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    used INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE IF NOT EXISTS oauth_tokens (
+                    token_hash TEXT PRIMARY KEY,
+                    client_id TEXT NOT NULL,
+                    expires_at TEXT NOT NULL
+                );
                 """
             )
             self._conn.commit()

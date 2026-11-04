@@ -19,6 +19,13 @@ AUDIT_FIELDS = (
     "cache_hit",
     "karte_status",
     "reason",
+    "action_id",
+    "action_kind",
+    "decision",
+    "origin",
+    "source_id",
+    "url_count",
+    "client_label",
 )
 
 _SOURCE_FIELDS = ("doc_id", "title", "relative_path")

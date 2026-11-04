@@ -17,6 +17,10 @@ _PROJECT_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 _ACTOR_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 TOKEN_ENV = "DISCORD_BOT_TOKEN"
+MCP_BEARER_ENV = "EPHY_MCP_BEARER_TOKEN"
+MCP_OAUTH_ENV = "EPHY_MCP_OAUTH_SECRET"
+# Chosen so a Node orchestrator on 3000/8080/8787 can keep its port.
+DEFAULT_MCP_PORT = 8791
 
 
 @dataclass(frozen=True)
@@ -64,15 +68,32 @@ class AuditConfig:
 
 
 @dataclass(frozen=True)
+class McpConfig:
+    enabled: bool
+    bind_host: str
+    port: int
+    public_base_url: str
+    token_ttl_seconds: int
+
+
+@dataclass(frozen=True)
+class ApprovalConfig:
+    expiry_seconds: int
+
+
+@dataclass(frozen=True)
 class AppConfig:
     guild_id: int
     allowed_channel_ids: frozenset[int]
     admin_user_ids: frozenset[int]
+    approver_user_ids: frozenset[int]
     llm: LlmConfig
     karte: KarteConfig
     cache: CacheConfig
     rate_limit: RateLimitConfig
     audit: AuditConfig
+    mcp: McpConfig
+    approval: ApprovalConfig
 
     @property
     def allowlist(self):
@@ -87,14 +108,21 @@ def load_config(path: str | Path) -> AppConfig:
         raw = tomllib.load(handle)
     if not isinstance(raw, dict):
         raise ValueError("config root must be a table")
-    _reject_unknown(raw, {"discord", "llm", "karte", "cache", "rate_limit", "audit"}, "root")
+    _reject_unknown(
+        raw,
+        {"discord", "llm", "karte", "cache", "rate_limit", "audit", "mcp", "approval"},
+        "root",
+    )
+    discord = _discord_section(raw.get("discord", {}))
     return AppConfig(
-        **_discord_section(raw.get("discord", {})),
+        **discord,
         llm=_llm_section(raw.get("llm", {})),
         karte=_karte_section(raw.get("karte", {})),
         cache=_cache_section(raw.get("cache", {})),
         rate_limit=_rate_section(raw.get("rate_limit", {})),
         audit=_audit_section(raw.get("audit", {})),
+        mcp=_mcp_section(raw.get("mcp", {})),
+        approval=_approval_section(raw.get("approval", {})),
     )
 
 
@@ -115,7 +143,11 @@ def read_bot_token() -> str:
 
 def _discord_section(raw: object) -> dict:
     data = _table(raw, "discord")
-    _reject_unknown(data, {"guild_id", "allowed_channel_ids", "admin_user_ids"}, "discord")
+    _reject_unknown(
+        data,
+        {"guild_id", "allowed_channel_ids", "admin_user_ids", "approver_user_ids"},
+        "discord",
+    )
     return {
         "guild_id": _snowflake(data.get("guild_id"), "discord.guild_id"),
         "allowed_channel_ids": frozenset(
@@ -123,6 +155,9 @@ def _discord_section(raw: object) -> dict:
         ),
         "admin_user_ids": frozenset(
             _snowflake_list(data.get("admin_user_ids", []), "discord.admin_user_ids")
+        ),
+        "approver_user_ids": frozenset(
+            _snowflake_list(data.get("approver_user_ids", []), "discord.approver_user_ids")
         ),
     }
 
@@ -239,6 +274,51 @@ def _audit_section(raw: object) -> AuditConfig:
     data = _table(raw, "audit")
     _reject_unknown(data, {"path"}, "audit")
     return AuditConfig(path=str(data.get("path", "data/audit.jsonl")))
+
+
+def _mcp_section(raw: object) -> McpConfig:
+    data = _table(raw, "mcp")
+    _reject_unknown(
+        data,
+        {"enabled", "bind_host", "port", "public_base_url", "token_ttl_seconds"},
+        "mcp",
+    )
+    host = str(data.get("bind_host", "127.0.0.1"))
+    if host not in _LOOPBACK_HOSTS:
+        raise ValueError("mcp.bind_host must be loopback")
+    return McpConfig(
+        enabled=_bool(data.get("enabled", False), "mcp.enabled"),
+        bind_host=host,
+        port=int(_number(data.get("port", DEFAULT_MCP_PORT), "mcp.port", 1, 65535)),
+        public_base_url=_public_base_url(str(data.get("public_base_url", ""))),
+        token_ttl_seconds=int(
+            _number(data.get("token_ttl_seconds", 3600), "mcp.token_ttl_seconds", 60, 86_400)
+        ),
+    )
+
+
+def _approval_section(raw: object) -> ApprovalConfig:
+    data = _table(raw, "approval")
+    _reject_unknown(data, {"expiry_seconds"}, "approval")
+    return ApprovalConfig(
+        expiry_seconds=int(
+            _number(data.get("expiry_seconds", 900), "approval.expiry_seconds", 30, 86_400)
+        )
+    )
+
+
+def _public_base_url(url: str) -> str:
+    cleaned = url.strip()
+    if not cleaned:
+        return ""
+    parsed = urlparse(cleaned)
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise ValueError("mcp.public_base_url must not include credentials, query, or fragment")
+    if parsed.scheme == "https" and parsed.hostname:
+        return cleaned.rstrip("/")
+    if parsed.scheme == "http" and parsed.hostname in _LOOPBACK_HOSTS and parsed.port:
+        return cleaned.rstrip("/")
+    raise ValueError("mcp.public_base_url must be https or loopback http with a port")
 
 
 def _loopback_base_url(url: str) -> str:

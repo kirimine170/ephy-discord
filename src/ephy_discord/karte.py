@@ -67,6 +67,14 @@ class StubKarteClient:
         del query
         return ContextPack(status="unavailable", sources=())
 
+    def search(self, query: str) -> dict:
+        del query
+        return {"status": "unavailable", "results": []}
+
+    def read_document(self, doc_id: str) -> dict:
+        del doc_id
+        return {"status": "unavailable", "document": None}
+
 
 class FilesystemKarteClient:
     def __init__(
@@ -88,6 +96,57 @@ class FilesystemKarteClient:
             directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         self._sleep = sleep
         self._monotonic = monotonic
+
+    def search(self, query: str) -> dict:
+        text = " ".join(query.split())
+        if not text:
+            return {"status": "ok", "results": []}
+        try:
+            response = self._exchange(
+                operation="search",
+                query={"text": text[:2048], "top_k": self.karte.top_k},
+                doc_id=None,
+            )
+        except KarteError:
+            return {"status": "unavailable", "results": []}
+        if response.get("status") != "ok":
+            return {"status": "unavailable", "results": []}
+        results = []
+        for item in response.get("results") or []:
+            if not isinstance(item, dict) or not _item_in_scope(item, self.karte):
+                return {"status": "unavailable", "results": []}
+            results.append(
+                {
+                    "doc_id": str(item.get("doc_id") or ""),
+                    "title": str(item.get("title") or ""),
+                    "relative_path": str(item.get("relative_path") or ""),
+                    "snippet": str(item.get("snippet") or "")[:2048],
+                    "score": item.get("score") or 0,
+                }
+            )
+        return {"status": "ok", "results": results}
+
+    def read_document(self, doc_id: str) -> dict:
+        identifier = doc_id.strip()
+        if not identifier:
+            return {"status": "unavailable", "document": None}
+        try:
+            response = self._exchange(operation="read", query=None, doc_id=identifier)
+        except KarteError:
+            return {"status": "unavailable", "document": None}
+        document = response.get("document") if response.get("status") == "ok" else None
+        if not isinstance(document, dict) or not _item_in_scope(document, self.karte):
+            return {"status": "unavailable", "document": None}
+        body = str(document.get("body") or "")[:_EXCERPT_CHARS]
+        return {
+            "status": "ok",
+            "document": {
+                "doc_id": str(document.get("doc_id") or ""),
+                "title": str(document.get("title") or ""),
+                "relative_path": str(document.get("relative_path") or ""),
+                "body": body,
+            },
+        }
 
     def search_and_read(self, query: str) -> ContextPack:
         text = " ".join(query.split())
