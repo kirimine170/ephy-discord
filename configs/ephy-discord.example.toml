@@ -34,6 +34,7 @@ actor_id = "ephy-discord"
 path = "data/ephy-discord.sqlite"
 dedupe_seconds = 600
 retention_days = 7
+store_all_messages = true
 
 [rate_limit]
 user_per_minute = 3

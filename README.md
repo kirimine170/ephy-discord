@@ -144,7 +144,8 @@ python -m ephy_discord run --config /path/to/ephy-discord.toml
 | `karte.actor_id` | `ephy-discord` | actor type は `ephy` 固定 |
 | `cache.path` | `data/ephy-discord.sqlite` | |
 | `cache.dedupe_seconds` | `600` | 同一質問の再利用 |
-| `cache.retention_days` | `7` | 本文と監査の保持 |
+| `cache.retention_days` | `7` | 本文，通常メッセージ，監査の保持 |
+| `cache.store_all_messages` | `true` | 許可チャンネルの通常メッセージも保存する |
 | `rate_limit.user_per_minute` | `3` | `window_seconds` のあいだのユーザー上限 |
 | `rate_limit.channel_per_minute` | `10` | 同ウィンドウのチャンネル上限 |
 | `rate_limit.window_seconds` | `60` | |

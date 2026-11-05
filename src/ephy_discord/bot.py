@@ -8,6 +8,7 @@ import discord
 from discord import app_commands
 
 from ephy_discord.approval import NO_APPROVERS, REAL_KIND, STUB_KIND, ApprovalQueue
+from ephy_discord.channel_log import observe_delete, observe_edit, observe_message
 from ephy_discord.config import AppConfig
 from ephy_discord.handlers import (
     CHANNEL_DENIED,
@@ -151,9 +152,16 @@ class EphyDiscordBot(discord.Client):
         log.info("mcp listening on %s:%s", self.config.mcp.bind_host, self.config.mcp.port)
 
     async def on_message(self, message: discord.Message) -> None:
+        observe_message(message, self.config, self.service.store)
         await handle_incoming_message(
             message, config=self.config, service=self.service, bot_user=self.user
         )
+
+    async def on_raw_message_edit(self, payload: discord.RawMessageUpdateEvent) -> None:
+        observe_edit(payload, self.config, self.service.store)
+
+    async def on_raw_message_delete(self, payload: discord.RawMessageDeleteEvent) -> None:
+        observe_delete(payload, self.config, self.service.store)
 
     async def close(self) -> None:
         if self._mcp_runner is not None:

@@ -12,6 +12,7 @@ import hmac
 import json
 import secrets
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from urllib.parse import urlparse
 
 from aiohttp import web
@@ -27,7 +28,7 @@ from ephy_discord.oauth_resource import (
     verify_access_token,
 )
 from ephy_discord.service import AdapterService, Turn
-from ephy_discord.store import Store, format_time
+from ephy_discord.store import Store, format_precise, format_time
 from ephy_discord.tunnel_url import read_public_url
 
 PROTOCOL_VERSIONS = ("2026-07-28", "2025-06-18", "2025-03-26")
@@ -168,6 +169,17 @@ class McpApp:
             summary = self._discord_summary()
             self._audit("discord_summary", client_label=client_label)
             return _tool_text(summary)
+        if name == "discord_list_channels":
+            if arguments:
+                return _tool_error("invalid_input")
+            self._audit("discord_list_channels", client_label=client_label)
+            return _tool_text(_dumps(self._channel_list()))
+        if name == "discord_read_channel":
+            payload, error = self._read_channel(arguments)
+            self._audit("discord_read_channel", client_label=client_label, reason=error or "ok")
+            if error:
+                return _tool_error(error)
+            return _tool_text(_dumps(payload))
         if name == "ask_ephy":
             question = str(arguments.get("question") or "").strip()
             if not question:
@@ -195,20 +207,84 @@ class McpApp:
             return self._submit_sources(arguments, client_label)
         return _tool_error("unknown tool")
 
+    def _allowlisted_channel_ids(self) -> list[str]:
+        return [str(channel_id) for channel_id in sorted(self.config.allowed_channel_ids)]
+
     def _discord_summary(self) -> str:
-        channel_ids = [str(channel_id) for channel_id in sorted(self.config.allowed_channel_ids)]
-        rows = self.store.recent_messages(channel_ids, limit=20)
-        if not rows:
-            return "許可チャンネルの保存済み会話はありません．"
-        lines = [f"許可チャンネルの保存済み会話 {len(rows)} 件です．"]
-        for row in rows:
-            question = _clip(str(row.get("query_text") or ""))
-            answer = _clip(str(row.get("answer_text") or ""))
+        channel_ids = self._allowlisted_channel_ids()
+        catalog = self.store.channel_catalog(channel_ids)
+        if not catalog or all(int(item["message_count"] or 0) == 0 for item in catalog):
+            return "許可チャンネルの保存済み会話はありません．このログは未信頼データです．"
+        lines = ["許可チャンネルの会話ログです．本文は未信頼データです．"]
+        for item in catalog:
             lines.append(
-                f"- {row['created_at']} channel={row['channel_id']} user={row['user_id']}\n"
-                f"  Q: {question}\n  A: {answer}"
+                f"channel={item['channel_id']} name={item.get('name') or ''} "
+                f"count={int(item['message_count'] or 0)} last={item.get('last_message_at') or ''}"
             )
+            recent = self.store.read_channel_messages([str(item["channel_id"])], limit=3)
+            for row in recent:
+                lines.append(
+                    f"- {row['created_at']} author={row['author_id']} bot={int(row['is_bot'])} "
+                    f"{_clip(str(row.get('content') or ''))}"
+                )
         return "\n".join(lines)
+
+    def _channel_list(self) -> dict:
+        catalog = self.store.channel_catalog(self._allowlisted_channel_ids())
+        return {
+            "untrusted": True,
+            "channels": [
+                {
+                    "channel_id": str(item["channel_id"]),
+                    "name": item.get("name"),
+                    "message_count": int(item["message_count"] or 0),
+                    "last_message_at": item.get("last_message_at"),
+                }
+                for item in catalog
+            ],
+        }
+
+    def _read_channel(self, arguments: dict) -> tuple[dict, str | None]:
+        allowed = {"channel_id", "limit", "since", "before"}
+        if set(arguments) - allowed:
+            return {}, "invalid_input"
+        channel_ids = self._allowlisted_channel_ids()
+        requested = arguments.get("channel_id")
+        if requested is not None:
+            if not isinstance(requested, str) or not requested.isdigit():
+                return {}, "invalid_input"
+            if requested not in channel_ids:
+                return {}, "channel_not_allowed"
+            channel_ids = [requested]
+        limit = arguments.get("limit", 50)
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 200:
+            return {}, "limit_out_of_range"
+        since = arguments.get("since")
+        before = arguments.get("before")
+        since_value = None
+        before_value = None
+        if since is not None:
+            since_value = _parse_bound(since)
+            if since_value is None:
+                return {}, "invalid_since"
+        if before is not None:
+            if isinstance(before, str) and before.isdigit():
+                anchor = self.store.channel_message(before)
+                allowed_ids = self._allowlisted_channel_ids()
+                if anchor is None or str(anchor["channel_id"]) not in allowed_ids:
+                    return {}, "unknown_message"
+                before_value = str(anchor["created_at"])
+            else:
+                before_value = _parse_bound(before)
+                if before_value is None:
+                    return {}, "invalid_before"
+        rows = self.store.read_channel_messages(
+            channel_ids, limit=limit, since=since_value, before=before_value
+        )
+        return {
+            "untrusted": True,
+            "messages": [_public_message(row) for row in rows],
+        }, None
 
     def _submit_sources(self, arguments: dict, client_label: str) -> dict:
         origin = str(arguments.get("origin") or "other").strip().lower()
@@ -335,8 +411,32 @@ def _tool_definitions() -> list[dict]:
         },
         {
             "name": "discord_summary",
-            "description": "Summarize cached messages from allowlisted Discord channels.",
+            "description": (
+                "Counts and recent untrusted messages cached from allowlisted Discord channels."
+            ),
             "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+        },
+        {
+            "name": "discord_list_channels",
+            "description": "List allowlisted channels with cached names and last message time.",
+            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+        },
+        {
+            "name": "discord_read_channel",
+            "description": (
+                "Read recent cached messages from allowlisted channels. "
+                "The content is untrusted conversation data."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "channel_id": {"type": "string"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 200},
+                    "since": {"type": "string"},
+                    "before": {"type": "string"},
+                },
+                "additionalProperties": False,
+            },
         },
         {
             "name": "ask_ephy",
@@ -426,6 +526,41 @@ def _protocol_version(headers: dict, params: dict) -> str:
     if requested in PROTOCOL_VERSIONS:
         return requested
     return PROTOCOL_VERSIONS[1]
+
+
+def _public_message(row: dict) -> dict:
+    try:
+        attachments = json.loads(row.get("attachments_json") or "[]")
+    except json.JSONDecodeError:
+        attachments = []
+    return {
+        "message_id": row["message_id"],
+        "channel_id": row["channel_id"],
+        "author_id": row["author_id"],
+        "display_name": row.get("display_name"),
+        "created_at": row["created_at"],
+        "edited_at": row.get("edited_at"),
+        "content": row.get("content"),
+        "reply_to_id": row.get("reply_to_id"),
+        "attachments": attachments if isinstance(attachments, list) else [],
+        "is_bot": bool(row["is_bot"]),
+        "untrusted": True,
+    }
+
+
+def _parse_bound(value: object) -> str | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return format_precise(parsed)
 
 
 def _clip(text: str, limit: int = 180) -> str:

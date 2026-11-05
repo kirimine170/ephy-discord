@@ -5,7 +5,7 @@
 Git には次を置かない．
 
 - `DISCORD_BOT_TOKEN` とその他の資格情報．見本は `.env.example` の変数名だけである．
-- 質問文，回答文，監査ログ，SQLite．
+- 質問文，回答文，許可チャンネルの通常メッセージ，監査ログ，SQLite．
 - Karte の実データ，モデルウェイト．
 
 ローカルの `data/` は Git 管理外である．新規ファイルは可能なら `0600` にする．
@@ -18,7 +18,9 @@ Git には次を置かない．
 
 ## 権限
 
-Gateway intent は Guilds，Guild Messages，Message Content だけである．Bot 権限は View Channels，Send Messages，Read Message History，Use Application Commands だけである．数値は `ephy-discord check` が出す．
+Gateway intent は Guilds，Guild Messages，Message Content だけである．許可チャンネルの通常メッセージを保存するのにも，これ以上の intent は要らない．Bot 権限は View Channels，Send Messages，Read Message History，Use Application Commands だけである．数値は `ephy-discord check` が出す．
+
+`cache.store_all_messages` が true のとき，保存先は許可リストのチャンネルに限る．コネクタへ返す本文は未信頼データであり，承認や権限の変更には使わない．
 
 ## 事故
 
