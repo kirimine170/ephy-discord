@@ -23,6 +23,12 @@ def format_time(value: datetime) -> str:
     return value.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def format_precise(value: datetime) -> str:
+    if value.tzinfo is None:
+        raise ValueError("timestamp must be timezone-aware")
+    return value.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
 def query_hash(question: str, model: str) -> str:
     normalized = " ".join(question.casefold().split())
     payload = f"{model}\n{normalized}".encode()
@@ -77,7 +83,9 @@ class Store:
             self._conn.close()
 
     def enforce_retention(self, *, vacuum: bool = True) -> int:
-        cutoff = format_time(self.clock.now() - timedelta(days=self.cache.retention_days))
+        age = timedelta(days=self.cache.retention_days)
+        cutoff = format_time(self.clock.now() - age)
+        precise_cutoff = format_precise(self.clock.now() - age)
         rate_cutoff = format_time(self.clock.now() - timedelta(seconds=self.rate.window_seconds))
         with self._lock:
             self._conn.execute(
@@ -87,6 +95,18 @@ class Store:
             deleted = self._conn.execute(
                 "DELETE FROM messages WHERE created_at <= ?",
                 (cutoff,),
+            ).rowcount
+            self._conn.execute(
+                """
+                UPDATE channel_messages
+                SET content = NULL, attachments_json = '[]', display_name = NULL
+                WHERE created_at <= ?
+                """,
+                (precise_cutoff,),
+            )
+            deleted += self._conn.execute(
+                "DELETE FROM channel_messages WHERE created_at <= ?",
+                (precise_cutoff,),
             ).rowcount
             self._conn.execute("DELETE FROM rate_events WHERE created_at <= ?", (rate_cutoff,))
             self._conn.execute("DELETE FROM external_sources WHERE created_at <= ?", (cutoff,))
@@ -197,6 +217,18 @@ class Store:
             deleted = self._conn.execute(
                 "DELETE FROM messages WHERE user_id = ?", (user_id,)
             ).rowcount
+            self._conn.execute(
+                """
+                UPDATE channel_messages
+                SET content = NULL, attachments_json = '[]', display_name = NULL
+                WHERE author_id = ?
+                """,
+                (user_id,),
+            )
+            deleted += self._conn.execute(
+                "DELETE FROM channel_messages WHERE author_id = ?",
+                (user_id,),
+            ).rowcount
             self._conn.commit()
             if deleted:
                 self._conn.execute("VACUUM")
@@ -206,6 +238,14 @@ class Store:
         with self._lock:
             count = self._count("SELECT COUNT(*) FROM messages")
             self._conn.execute("UPDATE messages SET query_text = NULL, answer_text = NULL")
+            self._conn.execute(
+                """
+                UPDATE channel_messages
+                SET content = NULL, attachments_json = '[]', display_name = NULL
+                """
+            )
+            self._conn.execute("DELETE FROM channel_messages")
+            self._conn.execute("DELETE FROM channel_directory")
             self._conn.execute("DELETE FROM messages")
             self._conn.execute("DELETE FROM rate_events")
             self._conn.execute("DELETE FROM external_sources")
@@ -216,6 +256,157 @@ class Store:
             self._conn.commit()
             self._conn.execute("VACUUM")
             return count
+
+    def upsert_channel_message(self, row: dict) -> None:
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO channel_messages (
+                    message_id, guild_id, channel_id, author_id, display_name, created_at,
+                    edited_at, content, reply_to_id, attachments_json, is_bot
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(message_id) DO UPDATE SET
+                    display_name = excluded.display_name,
+                    edited_at = excluded.edited_at,
+                    content = excluded.content,
+                    reply_to_id = excluded.reply_to_id,
+                    attachments_json = excluded.attachments_json,
+                    is_bot = excluded.is_bot
+                """,
+                (
+                    row["message_id"],
+                    row["guild_id"],
+                    row["channel_id"],
+                    row["author_id"],
+                    row.get("display_name"),
+                    row["created_at"],
+                    row.get("edited_at"),
+                    row.get("content"),
+                    row.get("reply_to_id"),
+                    row.get("attachments_json") or "[]",
+                    1 if row.get("is_bot") else 0,
+                ),
+            )
+            if row.get("channel_name"):
+                self._conn.execute(
+                    """
+                    INSERT INTO channel_directory (channel_id, guild_id, name)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(channel_id) DO UPDATE SET name = excluded.name
+                    """,
+                    (row["channel_id"], row["guild_id"], row["channel_name"]),
+                )
+            self._conn.commit()
+
+    def edit_channel_message(self, message_id: str, fields: dict) -> bool:
+        existing = self._channel_message(message_id)
+        if existing is None:
+            return False
+        assignments = []
+        values: list[object] = []
+        for key in (
+            "display_name",
+            "edited_at",
+            "content",
+            "reply_to_id",
+            "attachments_json",
+            "is_bot",
+        ):
+            if key not in fields:
+                continue
+            assignments.append(f"{key} = ?")
+            values.append(fields[key])
+        if not assignments:
+            return True
+        values.append(message_id)
+        with self._lock:
+            self._conn.execute(
+                f"UPDATE channel_messages SET {', '.join(assignments)} WHERE message_id = ?",
+                values,
+            )
+            self._conn.commit()
+        return True
+
+    def delete_channel_message(self, message_id: str) -> bool:
+        with self._lock:
+            self._conn.execute(
+                """
+                UPDATE channel_messages
+                SET content = NULL, attachments_json = '[]', display_name = NULL
+                WHERE message_id = ?
+                """,
+                (message_id,),
+            )
+            deleted = self._conn.execute(
+                "DELETE FROM channel_messages WHERE message_id = ?",
+                (message_id,),
+            ).rowcount
+            self._conn.commit()
+        return bool(deleted)
+
+    def channel_message(self, message_id: str) -> dict | None:
+        return self._channel_message(message_id)
+
+    def read_channel_messages(
+        self,
+        channel_ids: list[str],
+        *,
+        limit: int,
+        since: str | None = None,
+        before: str | None = None,
+    ) -> list[dict]:
+        if not channel_ids or limit < 1:
+            return []
+        placeholders = ",".join("?" for _ in channel_ids)
+        sql = f"""
+            SELECT message_id, channel_id, author_id, display_name, created_at, edited_at,
+                   content, reply_to_id, attachments_json, is_bot
+            FROM channel_messages
+            WHERE channel_id IN ({placeholders})
+        """
+        params: list[object] = list(channel_ids)
+        if since:
+            sql += " AND created_at >= ?"
+            params.append(since)
+        if before:
+            sql += " AND created_at < ?"
+            params.append(before)
+        sql += " ORDER BY created_at DESC, message_id DESC LIMIT ?"
+        params.append(limit)
+        with self._lock:
+            rows = self._conn.execute(sql, params).fetchall()
+        return [dict(row) for row in rows]
+
+    def channel_catalog(self, channel_ids: list[str]) -> list[dict]:
+        if not channel_ids:
+            return []
+        with self._lock:
+            rows = self._conn.execute(
+                f"""
+                SELECT c.channel_id AS channel_id,
+                       d.name AS name,
+                       COUNT(m.message_id) AS message_count,
+                       MAX(m.created_at) AS last_message_at
+                FROM (
+                    SELECT ? AS channel_id
+                    {"UNION ALL SELECT ?" * (len(channel_ids) - 1)}
+                ) AS c
+                LEFT JOIN channel_directory d ON d.channel_id = c.channel_id
+                LEFT JOIN channel_messages m ON m.channel_id = c.channel_id
+                GROUP BY c.channel_id, d.name
+                ORDER BY c.channel_id
+                """,
+                channel_ids,
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def _channel_message(self, message_id: str) -> dict | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM channel_messages WHERE message_id = ?",
+                (message_id,),
+            ).fetchone()
+        return dict(row) if row else None
 
     def recent_messages(self, channel_ids: list[str], limit: int = 20) -> list[dict]:
         if not channel_ids or limit < 1:
@@ -503,6 +694,28 @@ class Store:
                     ON rate_events(user_id, created_at);
                 CREATE INDEX IF NOT EXISTS idx_rate_channel
                     ON rate_events(channel_id, created_at);
+                CREATE TABLE IF NOT EXISTS channel_messages (
+                    message_id TEXT PRIMARY KEY,
+                    guild_id TEXT NOT NULL,
+                    channel_id TEXT NOT NULL,
+                    author_id TEXT NOT NULL,
+                    display_name TEXT,
+                    created_at TEXT NOT NULL,
+                    edited_at TEXT,
+                    content TEXT,
+                    reply_to_id TEXT,
+                    attachments_json TEXT NOT NULL DEFAULT '[]',
+                    is_bot INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE INDEX IF NOT EXISTS idx_channel_messages_channel_time
+                    ON channel_messages(channel_id, created_at);
+                CREATE INDEX IF NOT EXISTS idx_channel_messages_author
+                    ON channel_messages(author_id);
+                CREATE TABLE IF NOT EXISTS channel_directory (
+                    channel_id TEXT PRIMARY KEY,
+                    guild_id TEXT NOT NULL,
+                    name TEXT
+                );
                 CREATE TABLE IF NOT EXISTS external_sources (
                     id TEXT PRIMARY KEY,
                     created_at TEXT NOT NULL,

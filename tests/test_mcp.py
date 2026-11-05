@@ -41,6 +41,33 @@ def test_mcp_is_disabled_until_enabled_with_a_secret(tmp_path) -> None:
 @pytest.mark.asyncio
 async def test_mcp_tools_require_bearer_and_do_not_write_karte(tmp_path) -> None:
     app, service, llm, karte = _app(tmp_path)
+    service.store.upsert_channel_message(
+        {
+            "message_id": "1",
+            "guild_id": "1",
+            "channel_id": "10",
+            "author_id": "7",
+            "display_name": "member",
+            "created_at": "2026-11-04T00:00:00.000000Z",
+            "content": "許可チャンネルの質問",
+            "attachments_json": "[]",
+            "is_bot": False,
+            "channel_name": "general",
+        }
+    )
+    service.store.upsert_channel_message(
+        {
+            "message_id": "2",
+            "guild_id": "1",
+            "channel_id": "99",
+            "author_id": "7",
+            "display_name": "member",
+            "created_at": "2026-11-04T00:00:01.000000Z",
+            "content": "許可外の質問",
+            "attachments_json": "[]",
+            "is_bot": False,
+        }
+    )
     service.store.remember(
         guild_id="1",
         channel_id="10",
@@ -83,7 +110,15 @@ async def test_mcp_tools_require_bearer_and_do_not_write_karte(tmp_path) -> None
         json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).encode(),
     )
     names = [tool["name"] for tool in json.loads(listed.body)["result"]["tools"]]
-    assert names == ["karte_search", "karte_read", "discord_summary", "ask_ephy", "submit_sources"]
+    assert names == [
+        "karte_search",
+        "karte_read",
+        "discord_summary",
+        "discord_list_channels",
+        "discord_read_channel",
+        "ask_ephy",
+        "submit_sources",
+    ]
 
     summary = await _call(app, headers, "discord_summary", {})
     assert "許可チャンネルの質問" in summary

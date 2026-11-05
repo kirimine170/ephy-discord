@@ -53,6 +53,7 @@ class CacheConfig:
     path: str
     dedupe_seconds: int
     retention_days: int
+    store_all_messages: bool = True
 
 
 @dataclass(frozen=True)
@@ -244,13 +245,16 @@ def _karte_section(raw: object) -> KarteConfig:
 
 def _cache_section(raw: object) -> CacheConfig:
     data = _table(raw, "cache")
-    _reject_unknown(data, {"path", "dedupe_seconds", "retention_days"}, "cache")
+    _reject_unknown(
+        data, {"path", "dedupe_seconds", "retention_days", "store_all_messages"}, "cache"
+    )
     return CacheConfig(
         path=str(data.get("path", "data/ephy-discord.sqlite")),
         dedupe_seconds=int(
             _number(data.get("dedupe_seconds", 600), "cache.dedupe_seconds", 1, 86_400)
         ),
         retention_days=int(_number(data.get("retention_days", 7), "cache.retention_days", 1, 3650)),
+        store_all_messages=_bool(data.get("store_all_messages", True), "cache.store_all_messages"),
     )
 
 

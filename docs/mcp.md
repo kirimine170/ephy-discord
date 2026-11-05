@@ -10,7 +10,9 @@ ChatGPT のカスタム MCP，Grok のカスタムコネクタ，Meta Muse の�
 | --- | --- |
 | `karte_search` | Context Protocol v1 の search．読み取りだけ |
 | `karte_read` | 同じプロトコルの read |
-| `discord_summary` | 許可チャンネルに保存した会話の要約．許可外の行は返さない |
+| `discord_list_channels` | 許可チャンネルの ID，知っている名前，最後のメッセージ時刻 |
+| `discord_read_channel` | 許可チャンネルの保存済みメッセージ．`channel_id` は任意，`limit` は既定 50，最大 200，`since` は ISO 時刻，`before` はメッセージ ID または ISO 時刻．許可外は返さない |
+| `discord_summary` | 許可チャンネルごとの件数と最近の本文．通常のメッセージを含む．未信頼データ |
 | `ask_ephy` | ローカルモデルに Karte の参照付きで聞く．Discord へは投稿しない |
 | `submit_sources` | SNS の発見（本文と URL）をローカルキャッシュへ出典付きで置く．Karte には書かない |
 
