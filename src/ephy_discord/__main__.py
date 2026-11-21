@@ -7,6 +7,7 @@ import asyncio
 import logging
 import os
 import sys
+from pathlib import Path
 
 from ephy_discord import __version__
 from ephy_discord.bot import EphyDiscordBot, build_intents, minimal_permissions
@@ -37,6 +38,14 @@ def main(argv: list[str] | None = None) -> int:
 
     run = sub.add_parser("run", help="connect to Discord")
     run.add_argument("--config", required=True)
+    run.add_argument("--require-parliament", action="store_true")
+
+    sandbox = sub.add_parser(
+        "parliament-sandbox-check", help="measure native sandbox without a model"
+    )
+    sandbox.add_argument("--codex", type=Path, required=True)
+    sandbox.add_argument("--root", type=Path, required=True)
+    sandbox.add_argument("--read-root", type=Path, action="append", default=[])
 
     mock = sub.add_parser("mock-llm", help="serve a loopback chat completion mock")
     mock.add_argument("--host", default="127.0.0.1")
@@ -58,10 +67,54 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "answer":
         return asyncio.run(_answer(args.config, args.text))
     if args.command == "run":
-        return _run(args.config)
+        return _run(args.config, require_parliament=args.require_parliament)
+    if args.command == "parliament-sandbox-check":
+        return asyncio.run(_sandbox_check(args))
     if args.command == "mcp-url":
         return _mcp_url(args)
     return 2
+
+
+async def _sandbox_check(args) -> int:
+    import json
+
+    from ephy_discord.parliament import unlinked
+    from ephy_discord.parliament_executor import command
+    from ephy_discord.parliament_sandbox import NativeSandbox
+
+    root = unlinked(args.root)
+    root.mkdir(parents=True, exist_ok=False)
+    candidate = root / "candidate"
+    candidate.mkdir()
+    binary = unlinked(args.codex)
+    config = {
+        "read_roots": [
+            str(p)
+            for p in [Path(sys.prefix), Path(sys.base_prefix), binary.parent, *args.read_root]
+        ],
+        "denied_roots": [str(root)],
+    }
+    home = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
+    try:
+        result = await NativeSandbox(binary, config, home, command).controls(root, candidate)
+        readonly = await NativeSandbox(binary, config, home, command).controls(
+            root / "readonly", candidate, writable=False
+        )
+        print(
+            json.dumps(
+                {
+                    "native_controls_passed": True,
+                    "model_called": False,
+                    "controls": result["controls"],
+                    "readonly_controls": readonly["controls"],
+                }
+            )
+        )
+        return 0
+    except Exception as exc:
+        code = str(exc) if type(exc).__name__ == "ParliamentError" else type(exc).__name__
+        print(json.dumps({"native_controls_passed": False, "model_called": False, "code": code}))
+        return 1
 
 
 def _check(path: str) -> int:
@@ -72,6 +125,7 @@ def _check(path: str) -> int:
     print(f"ephy-discord {__version__}")
     print(f"guild_id={config.guild_id}")
     print(f"allowed_channels={len(config.allowed_channel_ids)}")
+    print(f"parliament_enabled={config.parliament_policy is not None}")
     print(
         f"llm={config.llm.base_url} model={config.llm.model} via_gateway={config.llm.via_gateway}"
     )
@@ -127,9 +181,12 @@ def _mcp_url(args) -> int:
     return 0
 
 
-def _run(path: str) -> int:
+def _run(path: str, *, require_parliament: bool = False) -> int:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s %(message)s")
     config = load_config(path)
+    if require_parliament and config.parliament_policy is None:
+        print("parliament policy is disabled", file=sys.stderr)
+        return 2
     try:
         token = read_bot_token()
     except RuntimeError as exc:

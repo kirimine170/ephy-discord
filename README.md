@@ -194,3 +194,7 @@ GitHub Actions は lint と pytest を実行する．テストは Discord，Gate
 ## License
 
 ライセンスは未選定である．
+
+## Discord議会（任意）
+
+登録IDで2〜N体を扱うメンション受付，最新developer roleによる実装認可，Codexの固定テストとDraft PR公開経路は[議会の設定と運用](docs/parliament.md)を参照してください．既定では無効で，既存の事務局やowner repairを変更しません．

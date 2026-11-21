@@ -120,15 +120,26 @@ class InteractionResponder:
 
 class EphyDiscordBot(discord.Client):
     def __init__(self, config: AppConfig, service: AdapterService) -> None:
-        super().__init__(intents=build_intents())
+        intents = build_intents()
+        if config.parliament_policy is not None:
+            intents.message_content = config.parliament_read_message_content
+        super().__init__(intents=intents)
         self.config = config
         self.service = service
         self.approvals = ApprovalQueue(config, service.store)
         self._mcp_runner = None
+        self.parliament = None
+        if config.parliament_policy is not None:
+            from ephy_discord.parliament_discord import ParliamentGateway
+
+            self.parliament = ParliamentGateway(self, config)
         self.tree = app_commands.CommandTree(self)
         self.tree.add_command(build_command_group(self))
 
     async def setup_hook(self) -> None:
+        if self.parliament is not None:
+            # Mention-only parliament processes do not sync commands or bind shared MCP ports．
+            return
         guild = discord.Object(id=self.config.guild_id)
         self.tree.copy_global_to(guild=guild)
         try:
@@ -152,6 +163,9 @@ class EphyDiscordBot(discord.Client):
         log.info("mcp listening on %s:%s", self.config.mcp.bind_host, self.config.mcp.port)
 
     async def on_message(self, message: discord.Message) -> None:
+        if self.parliament is not None:
+            await self.parliament.handle(message)
+            return
         observe_message(message, self.config, self.service.store)
         await handle_incoming_message(
             message, config=self.config, service=self.service, bot_user=self.user
@@ -164,10 +178,20 @@ class EphyDiscordBot(discord.Client):
         observe_delete(payload, self.config, self.service.store)
 
     async def close(self) -> None:
+        if self.parliament is not None:
+            await self.parliament.close()
         if self._mcp_runner is not None:
             await self._mcp_runner.cleanup()
         await self.service.aclose()
         await super().close()
+
+    async def on_ready(self) -> None:
+        if self.parliament is not None:
+            try:
+                await self.parliament.start()
+            except Exception as exc:
+                log.error("parliament_start_rejected:%s", type(exc).__name__)
+                await self.close()
 
 
 def build_command_group(bot: EphyDiscordBot) -> app_commands.Group:
