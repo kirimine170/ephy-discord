@@ -4,6 +4,7 @@ import asyncio
 import json
 import sys
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -107,7 +108,12 @@ def setup(tmp_path):
                 "allowed_paths": ["src/"],
                 "github_repository": "synthetic/parliament",
                 "base_branch": "main",
-                "checks": [{"argv": [sys.executable, "-m", "pytest"], "sha256": "0" * 64}],
+                "checks": [
+                    {
+                        "argv": [str(Path(sys.executable).resolve()), "-m", "pytest"],
+                        "sha256": "0" * 64,
+                    }
+                ],
             }
         },
         "state_dir": str(tmp_path / "private-state"),

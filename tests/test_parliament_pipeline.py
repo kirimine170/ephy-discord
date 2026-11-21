@@ -97,7 +97,7 @@ def pipeline(request):
     x.value["repositories"]["demo"]["checks"] = [
         {
             "argv": [
-                sys.executable,
+                str(Path(sys.executable).resolve()),
                 "-I",
                 "-c",
                 "import runpy; assert runpy.run_path('src/demo.py')['VALUE'] == 2",
