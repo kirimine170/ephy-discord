@@ -95,6 +95,8 @@ class AppConfig:
     audit: AuditConfig
     mcp: McpConfig
     approval: ApprovalConfig
+    parliament_policy: Path | None = None
+    parliament_read_message_content: bool = False
 
     @property
     def allowlist(self):
@@ -111,7 +113,17 @@ def load_config(path: str | Path) -> AppConfig:
         raise ValueError("config root must be a table")
     _reject_unknown(
         raw,
-        {"discord", "llm", "karte", "cache", "rate_limit", "audit", "mcp", "approval"},
+        {
+            "discord",
+            "llm",
+            "karte",
+            "cache",
+            "rate_limit",
+            "audit",
+            "mcp",
+            "approval",
+            "parliament",
+        },
         "root",
     )
     discord = _discord_section(raw.get("discord", {}))
@@ -124,7 +136,26 @@ def load_config(path: str | Path) -> AppConfig:
         audit=_audit_section(raw.get("audit", {})),
         mcp=_mcp_section(raw.get("mcp", {})),
         approval=_approval_section(raw.get("approval", {})),
+        parliament_policy=_parliament_section(raw.get("parliament", {})),
+        parliament_read_message_content=_bool(
+            _table(raw.get("parliament", {}), "parliament").get("read_message_content", False),
+            "parliament.read_message_content",
+        ),
     )
+
+
+def _parliament_section(raw: object) -> Path | None:
+    data = _table(raw, "parliament")
+    _reject_unknown(data, {"policy_file", "read_message_content"}, "parliament")
+    if not data:
+        return None
+    from ephy_discord.parliament import load_policy, unlinked
+
+    value = data.get("policy_file")
+    if not isinstance(value, str):
+        raise ValueError("parliament.policy_file must be an absolute local path")
+    path = unlinked(value)
+    return path if load_policy(path) is not None else None
 
 
 def resolved_karte_dir(config: AppConfig) -> str | None:

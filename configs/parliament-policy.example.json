@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "enabled": true,
+  "guild_id": 1,
+  "channel_id": 10,
+  "developer_role_id": 900,
+  "self_bot": "Builder",
+  "bots": {
+    "Grok": {"user_id": 100, "application_id": 1100, "backend": "existing", "conversation_url": ""},
+    "Dot": {"user_id": 200, "application_id": 1200, "backend": "existing", "conversation_url": ""},
+    "Builder": {"user_id": 300, "application_id": 1300, "backend": "codex", "conversation_url": ""}
+  },
+  "repositories": {
+    "example": {
+      "path": "C:/replace-with-clean-primary-checkout",
+      "member_ids": [500, 100, 200],
+      "recipient_bots": ["Builder"],
+      "allowed_paths": ["src/", "tests/", "docs/"],
+      "github_repository": "owner/allowed-repository",
+      "base_branch": "main",
+      "checks": [{"argv": ["C:/replace-with-python.exe", "-m", "pytest", "-q", "-p", "no:cacheprovider"], "sha256": "0000000000000000000000000000000000000000000000000000000000000000"}]
+    }
+  },
+  "state_dir": "C:/replace-with-private-parliament-state",
+  "codex": {"enabled": false}
+}
